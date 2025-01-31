@@ -1,12 +1,13 @@
-from typing import Callable
+from collections.abc import Callable
+from django.utils import timezone
+from dateutil.relativedelta import relativedelta
 from unittest.mock import MagicMock, patch
 
 from freezegun import freeze_time
 
 from posthog.models.cohort import Cohort
-from posthog.models.event import Event
 from posthog.models.person import Person
-from posthog.tasks.calculate_cohort import calculate_cohort_from_list
+from posthog.tasks.calculate_cohort import calculate_cohort_from_list, calculate_cohorts, MAX_AGE_MINUTES
 from posthog.test.base import APIBaseTest
 
 
@@ -32,7 +33,7 @@ def calculate_cohort_test_factory(event_factory: Callable, person_factory: Calla
             calculate_cohort_from_list(cohort_id, ["blabla"])
             cohort = Cohort.objects.get(pk=cohort_id)
             people = Person.objects.filter(cohort__id=cohort.pk)
-            self.assertEqual(len(people), 1)
+            self.assertEqual(people.count(), 1)
 
         @patch("posthog.tasks.calculate_cohort.calculate_cohort_from_list.delay")
         def test_create_trends_cohort(self, _calculate_cohort_from_list: MagicMock) -> None:
@@ -64,10 +65,30 @@ def calculate_cohort_test_factory(event_factory: Callable, person_factory: Calla
             calculate_cohort_from_list(cohort_id, ["blabla"])
             cohort = Cohort.objects.get(pk=cohort_id)
             people = Person.objects.filter(cohort__id=cohort.pk)
-            self.assertEqual(len(people), 1)
+            self.assertEqual(people.count(), 1)
+
+        @patch("posthog.tasks.calculate_cohort.update_cohort")
+        def test_exponential_backoff(self, patch_update_cohort: MagicMock) -> None:
+            # Exponential backoff
+            Cohort.objects.create(
+                last_calculation=timezone.now() - relativedelta(minutes=MAX_AGE_MINUTES + 1),
+                errors_calculating=1,
+                last_error_at=timezone.now() - relativedelta(minutes=60),  # Should be included
+                team_id=self.team.pk,
+            )
+            Cohort.objects.create(
+                last_calculation=timezone.now() - relativedelta(minutes=MAX_AGE_MINUTES + 1),
+                errors_calculating=5,
+                last_error_at=timezone.now() - relativedelta(minutes=60),  # Should be excluded
+                team_id=self.team.pk,
+            )
+            # Test empty last_error_at
+            Cohort.objects.create(
+                last_calculation=timezone.now() - relativedelta(minutes=MAX_AGE_MINUTES + 1),
+                errors_calculating=1,
+                team_id=self.team.pk,
+            )
+            calculate_cohorts(5)
+            self.assertEqual(patch_update_cohort.call_count, 2)
 
     return TestCalculateCohort
-
-
-class TestDjangoCalculateCohort(calculate_cohort_test_factory(Event.objects.create, Person.objects.create)):  # type: ignore
-    pass

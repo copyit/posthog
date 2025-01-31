@@ -1,195 +1,145 @@
-import { PluginEvent } from '@posthog/plugin-scaffold'
+import { DateTime } from 'luxon'
+import fetch, { FetchError } from 'node-fetch'
 
-import { Action, Person } from '../../../src/types'
-import {
-    determineWebhookType,
-    getActionDetails,
-    getFormattedMessage,
-    getTokens,
-    getUserDetails,
-    getValueOfToken,
-    WebhookType,
-} from '../../../src/worker/ingestion/hooks'
+import { Action, ISOTimestamp, PostIngestionEvent, Team } from '../../../src/types'
+import { AppMetrics } from '../../../src/worker/ingestion/app-metrics'
+import { HookCommander } from '../../../src/worker/ingestion/hooks'
+import { Hook } from './../../../src/types'
 
-describe('determineWebhookType', () => {
-    test('Slack', () => {
-        const webhookType = determineWebhookType('https://hooks.slack.com/services/')
-
-        expect(webhookType).toBe(WebhookType.Slack)
+describe('hooks', () => {
+    const team = { id: 123, person_display_name_properties: null } as Team
+    beforeEach(() => {
+        process.env.NODE_ENV = 'test'
     })
 
-    test('Discord', () => {
-        const webhookType = determineWebhookType('https://discord.com/api/webhooks/')
-
-        expect(webhookType).toBe(WebhookType.Discord)
-    })
-
-    test('Teams', () => {
-        const webhookType = determineWebhookType('https://outlook.office.com/webhook/')
-
-        expect(webhookType).toBe(WebhookType.Teams)
-    })
-})
-
-describe('getUserDetails', () => {
-    const event = { distinct_id: 2 } as unknown as PluginEvent
-    const person = { properties: { email: 'test@posthog.com' } } as unknown as Person
-
-    test('Slack', () => {
-        const [userDetails, userDetailsMarkdown] = getUserDetails(
-            event,
-            person,
-            'http://localhost:8000',
-            WebhookType.Slack
-        )
-
-        expect(userDetails).toBe('test@posthog.com')
-        expect(userDetailsMarkdown).toBe('<http://localhost:8000/person/2|test@posthog.com>')
-    })
-
-    test('Teams', () => {
-        const [userDetails, userDetailsMarkdown] = getUserDetails(
-            event,
-            person,
-            'http://localhost:8000',
-            WebhookType.Teams
-        )
-
-        expect(userDetails).toBe('test@posthog.com')
-        expect(userDetailsMarkdown).toBe('[test@posthog.com](http://localhost:8000/person/2)')
-    })
-})
-
-describe('getActionDetails', () => {
-    const action = { id: 1, name: 'action1' } as Action
-
-    test('Slack', () => {
-        const [actionDetails, actionDetailsMarkdown] = getActionDetails(
-            action,
-            'http://localhost:8000',
-            WebhookType.Slack
-        )
-
-        expect(actionDetails).toBe('action1')
-        expect(actionDetailsMarkdown).toBe('<http://localhost:8000/action/1|action1>')
-    })
-
-    test('Teams', () => {
-        const [actionDetails, actionDetailsMarkdown] = getActionDetails(
-            action,
-            'http://localhost:8000',
-            WebhookType.Teams
-        )
-
-        expect(actionDetails).toBe('action1')
-        expect(actionDetailsMarkdown).toBe('[action1](http://localhost:8000/action/1)')
-    })
-})
-
-describe('getTokens', () => {
-    test('works', () => {
-        const format = '[action.name] got done by [user.name]'
-
-        const [matchedTokens, tokenisedMessage] = getTokens(format)
-
-        expect(matchedTokens).toStrictEqual(['action.name', 'user.name'])
-        expect(tokenisedMessage).toBe('%s got done by %s')
-    })
-})
-
-describe('getValueOfToken', () => {
-    const action = { id: 1, name: 'action1' } as Action
-    const event = { distinct_id: 2, properties: { $browser: 'Chrome' } } as unknown as PluginEvent
-    const person = {} as Person
-
-    test('user name', () => {
-        const tokenUserName = ['user', 'name']
-
-        const [text, markdown] = getValueOfToken(
-            action,
-            event,
-            person,
-            'http://localhost:8000',
-            WebhookType.Teams,
-            tokenUserName
-        )
-
-        expect(text).toBe('2')
-        expect(markdown).toBe('[2](http://localhost:8000/person/2)')
-    })
-
-    test('user prop', () => {
-        const tokenUserPropString = ['user', 'browser']
-
-        const [text, markdown] = getValueOfToken(
-            action,
-            event,
-            person,
-            'http://localhost:8000',
-            WebhookType.Teams,
-            tokenUserPropString
-        )
-
-        expect(text).toBe('Chrome')
-        expect(markdown).toBe('Chrome')
-    })
-
-    test('user prop but missing', () => {
-        const tokenUserPropMissing = ['user', 'missing_property']
-
-        const [text, markdown] = getValueOfToken(
-            action,
-            event,
-            person,
-            'http://localhost:8000',
-            WebhookType.Teams,
-            tokenUserPropMissing
-        )
-
-        expect(text).toBe('undefined')
-        expect(markdown).toBe('undefined')
-    })
-})
-
-describe('getFormattedMessage', () => {
-    const event = {
-        distinct_id: 2,
-        properties: { $browser: 'Chrome', page_title: 'Pricing' },
-    } as unknown as PluginEvent
-    const person = {} as Person
-
-    test('custom format', () => {
+    describe('postRestHook', () => {
+        let hookCommander: HookCommander
+        let hook: Hook
         const action = {
             id: 1,
             name: 'action1',
-            slack_message_format:
-                '[user.name] from [user.browser] on [event.properties.page_title] page with [event.properties.fruit]',
+            // slack_message_format: '[user.name] did thing from browser [user.brauzer]',
         } as Action
 
-        const [text, markdown] = getFormattedMessage(action, event, person, 'https://localhost:8000', WebhookType.Slack)
-        expect(text).toBe('2 from Chrome on Pricing page with undefined')
-        expect(markdown).toBe('<https://localhost:8000/person/2|2> from Chrome on Pricing page with undefined')
-    })
+        beforeEach(() => {
+            hook = {
+                id: 'id',
+                team_id: 1,
+                user_id: 1,
+                resource_id: 1,
+                event: 'foo',
+                target: 'https://example.com/',
+                created: new Date().toISOString(),
+                updated: new Date().toISOString(),
+                format_text: null,
+            }
+            hookCommander = new HookCommander(
+                {} as any,
+                {} as any,
+                {} as any,
+                { enqueueIfEnabledForTeam: async () => Promise.resolve(false) },
+                { queueError: () => Promise.resolve(), queueMetric: () => Promise.resolve() } as unknown as AppMetrics,
+                20000
+            )
+        })
 
-    test('default format', () => {
-        const action = { id: 1, name: 'action1', slack_message_format: '' } as Action
+        test('person = undefined', async () => {
+            await hookCommander.postWebhook({ event: 'foo', properties: {} } as PostIngestionEvent, action, team, hook)
 
-        const [text, markdown] = getFormattedMessage(action, event, person, 'https://localhost:8000', WebhookType.Slack)
-        expect(text).toBe('action1 was triggered by 2')
-        expect(markdown).toBe(
-            '<https://localhost:8000/action/1|action1> was triggered by <https://localhost:8000/person/2|2>'
-        )
-    })
+            expect(fetch).toHaveBeenCalledTimes(1)
+            expect(fetch.mock.calls[0]).toMatchInlineSnapshot(`
+                [
+                  "https://example.com/",
+                  {
+                    "body": "{
+                    "hook": {
+                        "id": "id",
+                        "event": "foo",
+                        "target": "https://example.com/"
+                    },
+                    "data": {
+                        "event": "foo",
+                        "properties": {},
+                        "elementsList": [],
+                        "person": {}
+                    }
+                }",
+                    "headers": {
+                      "Content-Type": "application/json",
+                    },
+                    "method": "POST",
+                    "timeout": 20000,
+                  },
+                ]
+            `)
+        })
 
-    test('not quite correct format', () => {
-        const action = {
-            id: 1,
-            name: 'action1',
-            slack_message_format: '[user.name] did thing from browser [user.brauzer]',
-        } as Action
+        test('person data from the event', async () => {
+            const now = DateTime.utc(2024, 1, 1).toISO()
+            const uuid = '018f39d3-d94c-0000-eeef-df4a793f8844'
+            await hookCommander.postWebhook(
+                {
+                    eventUuid: uuid,
+                    distinctId: 'WALL-E',
+                    timestamp: now as ISOTimestamp,
+                    event: 'foo',
+                    teamId: hook.team_id,
+                    properties: {},
+                    person_id: uuid,
+                    person_properties: { foo: 'bar' },
+                    person_created_at: now as ISOTimestamp,
+                } as PostIngestionEvent,
+                action,
+                team,
+                hook
+            )
+            expect(fetch).toHaveBeenCalledTimes(1)
+            expect(fetch.mock.calls[0]).toMatchInlineSnapshot(`
+                [
+                  "https://example.com/",
+                  {
+                    "body": "{
+                    "hook": {
+                        "id": "id",
+                        "event": "foo",
+                        "target": "https://example.com/"
+                    },
+                    "data": {
+                        "eventUuid": "018f39d3-d94c-0000-eeef-df4a793f8844",
+                        "event": "foo",
+                        "teamId": 1,
+                        "distinctId": "WALL-E",
+                        "properties": {},
+                        "timestamp": "2024-01-01T00:00:00.000Z",
+                        "elementsList": [],
+                        "person": {
+                            "uuid": "018f39d3-d94c-0000-eeef-df4a793f8844",
+                            "properties": {
+                                "foo": "bar"
+                            },
+                            "created_at": "2024-01-01T00:00:00.000Z"
+                        }
+                    }
+                }",
+                    "headers": {
+                      "Content-Type": "application/json",
+                    },
+                    "method": "POST",
+                    "timeout": 20000,
+                  },
+                ]
+            `)
+        })
 
-        const [text, markdown] = getFormattedMessage(action, event, person, 'https://localhost:8000', WebhookType.Slack)
-        expect(text).toBe('2 did thing from browser undefined')
-        expect(markdown).toBe('<https://localhost:8000/person/2|2> did thing from browser undefined')
+        test('private IP hook forbidden in prod', async () => {
+            process.env.NODE_ENV = 'production'
+
+            await expect(
+                hookCommander.postWebhook({ event: 'foo', properties: {} } as PostIngestionEvent, action, team, {
+                    ...hook,
+                    target: 'http://127.0.0.1',
+                })
+            ).rejects.toThrow(new FetchError('Internal hostname', 'posthog-host-guard'))
+        })
     })
 })

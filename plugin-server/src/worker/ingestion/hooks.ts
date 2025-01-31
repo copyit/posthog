@@ -1,241 +1,249 @@
-import { PluginEvent } from '@posthog/plugin-scaffold'
 import { captureException } from '@sentry/node'
-import { StatsD } from 'hot-shots'
-import fetch from 'node-fetch'
-import { format } from 'util'
+import { Histogram } from 'prom-client'
+import { RustyHook } from 'worker/rusty-hook'
 
-import { Action, Hook, Person } from '../../types'
-import { DB } from '../../utils/db/db'
-import { stringify } from '../../utils/utils'
+import { Action, Hook, HookPayload, PostIngestionEvent, Team } from '../../types'
+import { PostgresRouter, PostgresUse } from '../../utils/db/postgres'
+import { convertToHookPayload } from '../../utils/event'
+import { trackedFetch } from '../../utils/fetch'
+import { status } from '../../utils/status'
+import { AppMetric, AppMetrics } from './app-metrics'
 import { OrganizationManager } from './organization-manager'
 import { TeamManager } from './team-manager'
+import { WebhookFormatter } from './webhook-formatter'
 
-export enum WebhookType {
-    Slack = 'slack',
-    Discord = 'discord',
-    Teams = 'teams',
-}
+export const webhookProcessStepDuration = new Histogram({
+    name: 'webhook_process_event_duration',
+    help: 'Processing step latency to during webhooks processing, per tag',
+    labelNames: ['tag'],
+})
 
-export function determineWebhookType(url: string): WebhookType {
-    url = url.toLowerCase()
-    if (url.includes('slack.com')) {
-        return WebhookType.Slack
-    }
-    if (url.includes('discord.com')) {
-        return WebhookType.Discord
-    }
-    return WebhookType.Teams
-}
-
-export function getUserDetails(
-    event: PluginEvent,
-    person: Person | undefined,
-    siteUrl: string,
-    webhookType: WebhookType
-): [string, string] {
-    if (!person) {
-        return ['undefined', 'undefined']
-    }
-    const userName = stringify(person.properties?.['email'] || event.distinct_id)
-    let userMarkdown: string
-    if (webhookType === WebhookType.Slack) {
-        userMarkdown = `<${siteUrl}/person/${event.distinct_id}|${userName}>`
-    } else {
-        userMarkdown = `[${userName}](${siteUrl}/person/${event.distinct_id})`
-    }
-    return [userName, userMarkdown]
-}
-
-export function getActionDetails(action: Action, siteUrl: string, webhookType: WebhookType): [string, string] {
-    const actionName = stringify(action.name)
-    let actionMarkdown: string
-    if (webhookType === WebhookType.Slack) {
-        actionMarkdown = `<${siteUrl}/action/${action.id}|${actionName}>`
-    } else {
-        actionMarkdown = `[${actionName}](${siteUrl}/action/${action.id})`
-    }
-    return [actionName, actionMarkdown]
-}
-
-export function getTokens(messageFormat: string): [string[], string] {
-    // This finds property value tokens, basically any string contained in square brackets
-    // Examples: "[foo]" is matched in "bar [foo]", "[action.name]" is matched in "action [action.name]"
-    const TOKENS_REGEX = /(?<=\[)(.*?)(?=\])/g
-    const matchedTokens = messageFormat.match(TOKENS_REGEX) || []
-    let tokenizedMessage = messageFormat
-    if (matchedTokens.length) {
-        tokenizedMessage = tokenizedMessage.replace(/\[(.*?)\]/g, '%s')
-    }
-    return [matchedTokens, tokenizedMessage]
-}
-
-export function getValueOfToken(
-    action: Action,
-    event: PluginEvent,
-    person: Person | undefined,
-    siteUrl: string,
-    webhookType: WebhookType,
-    tokenParts: string[]
-): [string, string] {
-    let text = ''
-    let markdown = ''
-
-    if (tokenParts[0] === 'user') {
-        if (tokenParts[1] === 'name') {
-            ;[text, markdown] = getUserDetails(event, person, siteUrl, webhookType)
-        } else {
-            const propertyName = `$${tokenParts[1]}`
-            const property = event.properties?.[propertyName]
-            text = stringify(property)
-            markdown = text
-        }
-    } else if (tokenParts[0] === 'action') {
-        if (tokenParts[1] === 'name') {
-            ;[text, markdown] = getActionDetails(action, siteUrl, webhookType)
-        }
-    } else if (tokenParts[0] === 'event') {
-        if (tokenParts[1] === 'name') {
-            text = stringify(event.event)
-        } else if (tokenParts[1] === 'properties' && tokenParts.length > 2) {
-            const propertyName = tokenParts[2]
-            const property = event.properties?.[propertyName]
-            text = stringify(property)
-        }
-        markdown = text
-    } else {
-        throw new Error()
-    }
-    return [text, markdown]
-}
-
-export function getFormattedMessage(
-    action: Action,
-    event: PluginEvent,
-    person: Person | undefined,
-    siteUrl: string,
-    webhookType: WebhookType
-): [string, string] {
-    const messageFormat = action.slack_message_format || '[action.name] was triggered by [user.name]'
-    let messageText: string
-    let messageMarkdown: string
-
-    try {
-        const [tokens, tokenizedMessage] = getTokens(messageFormat)
-        const values: string[] = []
-        const markdownValues: string[] = []
-
-        for (const token of tokens) {
-            const tokenParts = token.match(/\w+/g) || []
-
-            const [value, markdownValue] = getValueOfToken(action, event, person, siteUrl, webhookType, tokenParts)
-            values.push(value)
-            markdownValues.push(markdownValue)
-        }
-        messageText = format(tokenizedMessage, ...values)
-        messageMarkdown = format(tokenizedMessage, ...markdownValues)
-    } catch (error) {
-        const [actionName, actionMarkdown] = getActionDetails(action, siteUrl, webhookType)
-        messageText = `⚠ Error: There are one or more formatting errors in the message template for action "${actionName}".`
-        messageMarkdown = `*⚠ Error: There are one or more formatting errors in the message template for action "${actionMarkdown}".*`
-    }
-
-    return [messageText, messageMarkdown]
+export async function instrumentWebhookStep<T>(tag: string, run: () => Promise<T>): Promise<T> {
+    const end = webhookProcessStepDuration
+        .labels({
+            tag: tag,
+        })
+        .startTimer()
+    const res = await run()
+    end()
+    return res
 }
 
 export class HookCommander {
-    db: DB
+    postgres: PostgresRouter
     teamManager: TeamManager
     organizationManager: OrganizationManager
-    statsd: StatsD | undefined
+    rustyHook: RustyHook
+    appMetrics: AppMetrics
+    siteUrl: string
+    /** Hook request timeout in ms. */
+    EXTERNAL_REQUEST_TIMEOUT: number
 
-    constructor(db: DB, teamManager: TeamManager, organizationManager: OrganizationManager, statsd?: StatsD) {
-        this.db = db
+    constructor(
+        postgres: PostgresRouter,
+        teamManager: TeamManager,
+        organizationManager: OrganizationManager,
+        rustyHook: RustyHook,
+        appMetrics: AppMetrics,
+        timeout: number
+    ) {
+        this.postgres = postgres
         this.teamManager = teamManager
         this.organizationManager = organizationManager
-        this.statsd = statsd
+        if (process.env.SITE_URL) {
+            this.siteUrl = process.env.SITE_URL
+        } else {
+            status.warn('⚠️', 'SITE_URL env is not set for webhooks')
+            this.siteUrl = ''
+        }
+        this.rustyHook = rustyHook
+        this.appMetrics = appMetrics
+        this.EXTERNAL_REQUEST_TIMEOUT = timeout
     }
 
-    public async findAndFireHooks(
-        event: PluginEvent,
-        person: Person | undefined,
-        siteUrl: string,
-        actionMatches: Action[]
-    ): Promise<void> {
+    public async findAndFireHooks(event: PostIngestionEvent, actionMatches: Action[]): Promise<void> {
+        status.debug('🔍', `Looking for hooks to fire for event "${event.event}"`)
         if (!actionMatches.length) {
+            status.debug('🔍', `No hooks to fire for event "${event.event}"`)
             return
         }
+        status.debug('🔍', `Found ${actionMatches.length} matching actions`)
 
-        const team = await this.teamManager.fetchTeam(event.team_id)
+        const team = await this.teamManager.fetchTeam(event.teamId)
 
         if (!team) {
             return
         }
 
         const webhookUrl = team.slack_incoming_webhook
-        const organization = await this.organizationManager.fetchOrganization(team.organization_id)
 
         if (webhookUrl) {
-            const webhookRequests = actionMatches
-                .filter((action) => action.post_to_slack)
-                .map((action) => this.postWebhook(webhookUrl, action, event, person, siteUrl))
-            await Promise.all(webhookRequests).catch((error) => captureException(error))
-        }
-
-        if (organization!.available_features.includes('zapier')) {
-            const restHooks = (
-                await Promise.all(
-                    actionMatches.map(
-                        async (action) => await this.db.fetchRelevantRestHooks(team.id, 'action_performed', action.id)
-                    )
+            await instrumentWebhookStep('postWebhook', async () => {
+                const webhookRequests = actionMatches
+                    .filter((action) => action.post_to_slack)
+                    .map((action) => this.postWebhook(event, action, team))
+                await Promise.all(webhookRequests).catch((error) =>
+                    captureException(error, { tags: { team_id: event.teamId } })
                 )
-            ).flat()
-            const restHookRequests = restHooks.map((hook) => this.postRestHook(hook, event, person))
-            await Promise.all(restHookRequests).catch((error) => captureException(error))
+            })
+        }
+
+        if (await this.organizationManager.hasAvailableFeature(team.id, 'zapier')) {
+            await instrumentWebhookStep('postRestHook', async () => {
+                const restHooks = actionMatches.flatMap((action) => action.hooks.map((hook) => ({ hook, action })))
+
+                if (restHooks.length > 0) {
+                    const restHookRequests = restHooks.map(({ hook, action }) =>
+                        this.postWebhook(event, action, team, hook)
+                    )
+                    await Promise.all(restHookRequests).catch((error) =>
+                        captureException(error, { tags: { team_id: event.teamId } })
+                    )
+                }
+            })
         }
     }
 
-    private async postWebhook(
+    private formatMessage(
         webhookUrl: string,
+        messageFormat: string,
         action: Action,
-        event: PluginEvent,
-        person: Person | undefined,
-        siteUrl: string
-    ): Promise<void> {
-        const webhookType = determineWebhookType(webhookUrl)
-        const [messageText, messageMarkdown] = getFormattedMessage(action, event, person, siteUrl, webhookType)
-        let message: Record<string, any>
-        if (webhookType === WebhookType.Slack) {
-            message = {
-                text: messageText,
-                blocks: [{ type: 'section', text: { type: 'mrkdwn', text: messageMarkdown } }],
-            }
-        } else {
-            message = {
-                text: messageMarkdown,
-            }
+        event: PostIngestionEvent,
+        team: Team
+    ): Record<string, any> {
+        const endTimer = webhookProcessStepDuration.labels('messageFormatting').startTimer()
+        try {
+            const webhookFormatter = new WebhookFormatter({
+                webhookUrl,
+                messageFormat,
+                event,
+                team,
+                siteUrl: this.siteUrl,
+                sourceName: action.name ?? 'Unamed action',
+                sourcePath: `/action/${action.id}`,
+            })
+            return webhookFormatter.generateWebhookPayload()
+        } finally {
+            endTimer()
         }
-        await fetch(webhookUrl, {
-            method: 'POST',
-            body: JSON.stringify(message, undefined, 4),
-            headers: { 'Content-Type': 'application/json' },
-        })
-        this.statsd?.increment('webhook_firings')
     }
 
-    private async postRestHook(hook: Hook, event: PluginEvent, person: Person | undefined): Promise<void> {
-        const payload = {
-            hook: { id: hook.id, event: hook.event, target: hook.target },
-            data: { ...event, person },
+    public async postWebhook(event: PostIngestionEvent, action: Action, team: Team, hook?: Hook): Promise<void> {
+        // Used if no hook is provided
+        const defaultWebhookUrl = team.slack_incoming_webhook
+        // -2 is hardcoded to mean webhooks, -1 for resthooks
+        const SPECIAL_CONFIG_ID = hook ? -1 : -2
+        const partialMetric: AppMetric = {
+            teamId: event.teamId,
+            pluginConfigId: SPECIAL_CONFIG_ID,
+            category: 'webhook',
+            successes: 1,
         }
-        const request = await fetch(hook.target, {
-            method: 'POST',
-            body: JSON.stringify(payload, undefined, 4),
-            headers: { 'Content-Type': 'application/json' },
+
+        const url = hook ? hook.target : defaultWebhookUrl
+        let body: any
+
+        if (!url) {
+            // NOTE: Typically this is covered by the caller already
+            return
+        }
+
+        if (!hook) {
+            const messageFormat = action.slack_message_format || '[action.name] was triggered by [person]'
+            body = this.formatMessage(url, messageFormat, action, event, team)
+        } else {
+            const hookBody: HookPayload = {
+                hook: { id: hook.id, event: hook.event, target: hook.target },
+                data: convertToHookPayload(event),
+            }
+
+            body = hookBody
+        }
+
+        const enqueuedInRustyHook = await this.rustyHook.enqueueIfEnabledForTeam({
+            webhook: {
+                url,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body, undefined, 4),
+            },
+            teamId: event.teamId,
+            pluginId: SPECIAL_CONFIG_ID,
+            pluginConfigId: SPECIAL_CONFIG_ID, // -2 is hardcoded to mean webhooks
         })
-        if (request.status === 410) {
-            // Delete hook on our side if it's gone on Zapier's
-            await this.db.deleteRestHook(hook.id)
+
+        if (enqueuedInRustyHook) {
+            // Rusty-Hook handles it from here, so we're done.
+            return
         }
-        this.statsd?.increment('rest_hook_firings')
+
+        const slowWarningTimeout = this.EXTERNAL_REQUEST_TIMEOUT * 0.7
+        const timeout = setTimeout(() => {
+            status.warn(
+                '⌛',
+                `Posting Webhook slow. Timeout warning after ${slowWarningTimeout / 1000} sec! url=${url} team_id=${
+                    team.id
+                } event_id=${event.eventUuid}`
+            )
+        }, slowWarningTimeout)
+
+        status.debug('⚠️', `Firing webhook ${url} for team ${team.id}`)
+
+        try {
+            await instrumentWebhookStep('fetch', async () => {
+                const request = await trackedFetch(url, {
+                    method: 'POST',
+                    body: JSON.stringify(body, null, 4),
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: this.EXTERNAL_REQUEST_TIMEOUT,
+                })
+                // special handling for hooks
+                if (hook && request.status === 410) {
+                    // Delete hook on our side if it's gone on Zapier's
+                    await this.deleteRestHook(hook.id)
+                }
+                if (!request.ok) {
+                    status.warn('⚠️', `HTTP status ${request.status} for team ${team.id}`)
+                    await this.appMetrics.queueError(
+                        {
+                            ...partialMetric,
+                            failures: 1,
+                        },
+                        {
+                            error: `Request failed with HTTP status ${request.status}`,
+                            event,
+                        }
+                    )
+                } else {
+                    await this.appMetrics.queueMetric({
+                        ...partialMetric,
+                        successes: 1,
+                    })
+                }
+            })
+        } catch (error) {
+            await this.appMetrics.queueError(
+                {
+                    ...partialMetric,
+                    failures: 1,
+                },
+                {
+                    error,
+                    event,
+                }
+            )
+            throw error
+        } finally {
+            clearTimeout(timeout)
+        }
+    }
+
+    private async deleteRestHook(hookId: Hook['id']): Promise<void> {
+        await this.postgres.query(
+            PostgresUse.COMMON_WRITE,
+            `DELETE FROM ee_hook WHERE id = $1`,
+            [hookId],
+            'deleteRestHook'
+        )
     }
 }

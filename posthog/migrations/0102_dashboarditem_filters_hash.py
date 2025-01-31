@@ -24,7 +24,6 @@ def reverse(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0101_org_owners"),
     ]
@@ -35,5 +34,5 @@ class Migration(migrations.Migration):
             name="filters_hash",
             field=models.CharField(blank=True, max_length=400, null=True),
         ),
-        migrations.RunPython(forward, reverse),
+        migrations.RunPython(forward, reverse, elidable=True),
     ]

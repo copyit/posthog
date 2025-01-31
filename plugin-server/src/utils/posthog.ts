@@ -1,11 +1,27 @@
-import nodeFetch from 'node-fetch'
-import { nodePostHog } from 'posthog-js-lite/dist/src/targets/node'
+import { PostHog } from 'posthog-node'
 
-export const posthog = nodePostHog('sTMFPsFhdP1Ssg', {
-    fetch: nodeFetch,
-    apiHost: 'https://app.posthog.com',
+import { Team } from '../types'
+
+export const posthog = new PostHog('sTMFPsFhdP1Ssg', {
+    host: 'https://us.i.posthog.com',
 })
 
 if (process.env.NODE_ENV === 'test') {
-    posthog.optOut()
+    posthog.disable()
+}
+
+export const captureTeamEvent = (team: Team, event: string, properties: Record<string, any> = {}): void => {
+    posthog.capture({
+        distinctId: team.uuid,
+        event,
+        properties: {
+            team: team.uuid,
+            ...properties,
+        },
+        groups: {
+            project: team.uuid,
+            organization: team.organization_id,
+            instance: process.env.SITE_URL ?? 'unknown',
+        },
+    })
 }

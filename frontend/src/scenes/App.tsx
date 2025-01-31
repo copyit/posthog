@@ -1,31 +1,43 @@
-import React from 'react'
-import { kea, useMountedLogic, useValues } from 'kea'
-import { Layout } from 'antd'
-import { ToastContainer, Slide } from 'react-toastify'
-import { preflightLogic } from './PreflightCheck/logic'
-import { userLogic } from 'scenes/userLogic'
-import { sceneLogic } from 'scenes/sceneLogic'
-import { SceneLoading } from 'lib/utils'
-import { UpgradeModal } from './UpgradeModal'
+import { actions, BindLogic, connect, events, kea, path, reducers, selectors, useMountedLogic, useValues } from 'kea'
+import { MOCK_NODE_PROCESS } from 'lib/constants'
+import { useThemedHtml } from 'lib/hooks/useThemedHtml'
+import { ToastCloseButton } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { SpinnerOverlay } from 'lib/lemon-ui/Spinner/Spinner'
+import { apiStatusLogic } from 'lib/logic/apiStatusLogic'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { appLogicType } from './AppType'
-import { models } from '~/models'
-import { teamLogic } from './teamLogic'
-import { LoadedScene } from 'scenes/sceneTypes'
+import { Slide, ToastContainer } from 'react-toastify'
 import { appScenes } from 'scenes/appScenes'
-import { Navigation } from '~/layout/navigation/Navigation'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { LoadedScene } from 'scenes/sceneTypes'
+import { userLogic } from 'scenes/userLogic'
 
-export const appLogic = kea<appLogicType>({
-    path: ['scenes', 'App'],
-    actions: {
+import { ErrorBoundary } from '~/layout/ErrorBoundary'
+import { GlobalModals } from '~/layout/GlobalModals'
+import { breadcrumbsLogic } from '~/layout/navigation/Breadcrumbs/breadcrumbsLogic'
+import { Navigation } from '~/layout/navigation-3000/Navigation'
+import { themeLogic } from '~/layout/navigation-3000/themeLogic'
+import { actionsModel } from '~/models/actionsModel'
+import { cohortsModel } from '~/models/cohortsModel'
+
+import type { appLogicType } from './AppType'
+import { preflightLogic } from './PreflightCheck/preflightLogic'
+import { teamLogic } from './teamLogic'
+
+window.process = MOCK_NODE_PROCESS
+
+export const appLogic = kea<appLogicType>([
+    path(['scenes', 'App']),
+    connect([teamLogic, organizationLogic, actionsModel, cohortsModel]),
+    actions({
         enableDelayedSpinner: true,
         ignoreFeatureFlags: true,
-    },
-    reducers: {
+    }),
+    reducers({
         showingDelayedSpinner: [false, { enableDelayedSpinner: () => true }],
         featureFlagsTimedOut: [false, { ignoreFeatureFlags: () => true }],
-    },
-    selectors: {
+    }),
+    selectors({
         showApp: [
             (s) => [
                 userLogic.selectors.userLoading,
@@ -43,8 +55,8 @@ export const appLogic = kea<appLogicType>({
                 )
             },
         ],
-    },
-    events: ({ actions, cache }) => ({
+    }),
+    events(({ actions, cache }) => ({
         afterMount: () => {
             cache.spinnerTimeout = window.setTimeout(() => actions.enableDelayedSpinner(), 1000)
             cache.featureFlagTimeout = window.setTimeout(() => actions.ignoreFeatureFlags(), 3000)
@@ -53,26 +65,25 @@ export const appLogic = kea<appLogicType>({
             window.clearTimeout(cache.spinnerTimeout)
             window.clearTimeout(cache.featureFlagTimeout)
         },
-    }),
-})
+    })),
+])
 
 export function App(): JSX.Element | null {
     const { showApp, showingDelayedSpinner } = useValues(appLogic)
-    const { user } = useValues(userLogic)
-    const { currentTeamId } = useValues(teamLogic)
     useMountedLogic(sceneLogic({ scenes: appScenes }))
+    useMountedLogic(apiStatusLogic)
+    useThemedHtml()
 
     if (showApp) {
         return (
             <>
-                {user && currentTeamId ? <Models /> : null}
                 <LoadedSceneLogics />
                 <AppScene />
             </>
         )
     }
 
-    return showingDelayedSpinner ? <SceneLoading /> : null
+    return <SpinnerOverlay sceneLevel visible={showingDelayedSpinner} />
 }
 
 function LoadedSceneLogic({ scene }: { scene: LoadedScene }): null {
@@ -96,39 +107,59 @@ function LoadedSceneLogics(): JSX.Element {
     )
 }
 
-/** Loads every logic in the "src/models" folder */
-function Models(): null {
-    useMountedLogic(models)
-    return null
-}
-
 function AppScene(): JSX.Element | null {
+    useMountedLogic(breadcrumbsLogic)
     const { user } = useValues(userLogic)
-    const { activeScene, params, loadedScenes, sceneConfig } = useValues(sceneLogic)
+    const { activeScene, activeLoadedScene, sceneParams, params, loadedScenes, sceneConfig } = useValues(sceneLogic)
     const { showingDelayedSpinner } = useValues(appLogic)
+    const { isDarkModeOn } = useValues(themeLogic)
 
-    const SceneComponent: (...args: any[]) => JSX.Element | null =
-        (activeScene ? loadedScenes[activeScene]?.component : null) ||
-        (() => (showingDelayedSpinner ? <SceneLoading /> : null))
+    const toastContainer = (
+        <ToastContainer
+            autoClose={6000}
+            transition={Slide}
+            closeOnClick={false}
+            draggable={false}
+            closeButton={<ToastCloseButton />}
+            position="bottom-right"
+            theme={isDarkModeOn ? 'dark' : 'light'}
+        />
+    )
 
-    const toastContainer = <ToastContainer autoClose={8000} transition={Slide} position="bottom-right" />
+    let sceneElement: JSX.Element
+    if (activeScene && activeScene in loadedScenes) {
+        const { component: SceneComponent } = loadedScenes[activeScene]
+        sceneElement = <SceneComponent user={user} {...params} />
+    } else {
+        sceneElement = <SpinnerOverlay sceneLevel visible={showingDelayedSpinner} />
+    }
+
+    const wrappedSceneElement = (
+        <ErrorBoundary key={activeScene} tags={{ feature: activeScene }}>
+            {activeLoadedScene?.logic ? (
+                <BindLogic logic={activeLoadedScene.logic} props={activeLoadedScene.paramsToProps?.(sceneParams) || {}}>
+                    {sceneElement}
+                </BindLogic>
+            ) : (
+                sceneElement
+            )}
+        </ErrorBoundary>
+    )
 
     if (!user) {
         return sceneConfig?.onlyUnauthenticated || sceneConfig?.allowUnauthenticated ? (
-            <Layout style={{ minHeight: '100vh' }}>
-                <SceneComponent {...params} />
+            <>
+                {wrappedSceneElement}
                 {toastContainer}
-            </Layout>
+            </>
         ) : null
     }
 
     return (
         <>
-            <Navigation>
-                <SceneComponent user={user} {...params} />
-            </Navigation>
+            <Navigation sceneConfig={sceneConfig}>{wrappedSceneElement}</Navigation>
             {toastContainer}
-            <UpgradeModal />
+            <GlobalModals />
         </>
     )
 }

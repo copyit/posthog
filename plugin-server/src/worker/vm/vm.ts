@@ -1,38 +1,46 @@
 import { RetryError } from '@posthog/plugin-scaffold'
 import { randomBytes } from 'crypto'
+import { Summary } from 'prom-client'
 import { VM } from 'vm2'
 
 import { Hub, PluginConfig, PluginConfigVMResponse } from '../../types'
 import { createCache } from './extensions/cache'
 import { createConsole } from './extensions/console'
 import { createGeoIp } from './extensions/geoip'
-import { createGoogle } from './extensions/google'
 import { createJobs } from './extensions/jobs'
-import { createMetrics, setupMetrics } from './extensions/metrics'
 import { createPosthog } from './extensions/posthog'
 import { createStorage } from './extensions/storage'
 import { createUtils } from './extensions/utilities'
-import { imports } from './imports'
+import { AVAILABLE_IMPORTS } from './imports'
 import { transformCode } from './transforms'
-import { upgradeExportEvents } from './upgrades/export-events'
-import { addHistoricalEventsExportCapability } from './upgrades/historical-export/export-historical-events'
 
-export class TimeoutError extends Error {
+export class TimeoutError extends RetryError {
     name = 'TimeoutError'
     caller?: string = undefined
+    pluginConfig?: PluginConfig = undefined
 
-    constructor(message: string, caller?: string) {
+    constructor(message: string, caller?: string, pluginConfig?: PluginConfig) {
         super(message)
         this.caller = caller
+        this.pluginConfig = pluginConfig
     }
 }
 
-export async function createPluginConfigVM(
+const vmSetupMsSummary = new Summary({
+    name: 'vm_setup_ms',
+    help: 'Time to setup vm',
+    labelNames: ['plugin_id'],
+})
+
+export function createPluginConfigVM(
     hub: Hub,
     pluginConfig: PluginConfig, // NB! might have team_id = 0
     indexJs: string
-): Promise<PluginConfigVMResponse> {
-    const transformedCode = transformCode(indexJs, hub, imports)
+): PluginConfigVMResponse {
+    const timer = new Date()
+
+    const usedImports: Set<string> = new Set()
+    const transformedCode = transformCode(indexJs, hub, AVAILABLE_IMPORTS, usedImports)
 
     // Create virtual machine
     const vm = new VM({
@@ -45,10 +53,14 @@ export async function createPluginConfigVM(
     vm.freeze(createPosthog(hub, pluginConfig), 'posthog')
 
     // Add non-PostHog utilities to virtual machine
-    vm.freeze(imports['node-fetch'], 'fetch')
-    vm.freeze(createGoogle(), 'google')
+    vm.freeze(AVAILABLE_IMPORTS['node-fetch'], 'fetch')
 
-    vm.freeze(imports, '__pluginHostImports')
+    // Add used imports to the virtual machine
+    const pluginHostImports: Record<string, any> = {}
+    for (const usedImport of usedImports) {
+        pluginHostImports[usedImport] = (AVAILABLE_IMPORTS as Record<string, any>)[usedImport]
+    }
+    vm.freeze(pluginHostImports, '__pluginHostImports')
 
     if (process.env.NODE_ENV === 'test') {
         vm.freeze(setTimeout, '__jestSetTimeout')
@@ -70,8 +82,8 @@ export async function createPluginConfigVM(
                 setTimeout(() => {
                     const message = `Script execution timed out after promise waited for ${timeout} second${
                         timeout === 1 ? '' : 's'
-                    }`
-                    reject(new TimeoutError(message, `${name}`))
+                    } (${pluginConfig.plugin?.name}, name: ${name}, pluginConfigId: ${pluginConfig.id})`
+                    reject(new TimeoutError(message, `${name}`, pluginConfig))
                 }, timeout * 1000)
             ),
         ])
@@ -87,7 +99,6 @@ export async function createPluginConfigVM(
             storage: createStorage(hub, pluginConfig),
             geoip: createGeoIp(hub),
             jobs: createJobs(hub, pluginConfig),
-            metrics: createMetrics(hub, pluginConfig),
             utils: createUtils(hub, pluginConfig.id),
         },
         '__pluginHostMeta'
@@ -169,18 +180,16 @@ export async function createPluginConfigVM(
             const __methods = {
                 setupPlugin: __asyncFunctionGuard(__bindMeta('setupPlugin'), 'setupPlugin'),
                 teardownPlugin: __asyncFunctionGuard(__bindMeta('teardownPlugin'), 'teardownPlugin'),
-                exportEvents: __asyncFunctionGuard(__bindMeta('exportEvents'), 'exportEvents'),
                 onEvent: __asyncFunctionGuard(__bindMeta('onEvent'), 'onEvent'),
-                onAction: __asyncFunctionGuard(__bindMeta('onAction'), 'onAction'),
-                onSnapshot: __asyncFunctionGuard(__bindMeta('onSnapshot'), 'onSnapshot'),
                 processEvent: __asyncFunctionGuard(__bindMeta('processEvent'), 'processEvent'),
+                composeWebhook: __bindMeta('composeWebhook'),
+                getSettings: __bindMeta('getSettings'),
             };
 
             const __tasks = {
                 schedule: {},
                 job: {},
             };
-            const __metrics = {}
 
             for (const exportDestination of exportDestinations.reverse()) {
                 // gather the runEveryX commands and export in __tasks
@@ -205,36 +214,23 @@ export async function createPluginConfigVM(
                     }
                 }
 
-                if (typeof exportDestination['metrics'] === 'object') {
-                    for (const [key, value] of Object.entries(exportDestination['metrics'])) {
-                        if (typeof value === 'string') {
-                            __metrics[key] = value.toLowerCase()
-                        }
-                    }
-                }
 
             }
 
-            ${responseVar} = { methods: __methods, tasks: __tasks, meta: __pluginMeta, metrics: __metrics, }
+            ${responseVar} = { methods: __methods, tasks: __tasks, meta: __pluginMeta, }
         })
     `)(asyncGuard)
 
     const vmResponse = vm.run(responseVar)
-    const { methods, tasks, metrics } = vmResponse
-    const exportEventsExists = !!methods.exportEvents
+    const { methods, tasks } = vmResponse
 
-    if (exportEventsExists) {
-        upgradeExportEvents(hub, pluginConfig, vmResponse)
-        await addHistoricalEventsExportCapability(hub, pluginConfig, vmResponse)
-    }
-
-    setupMetrics(hub, pluginConfig, metrics, exportEventsExists)
-
-    await vm.run(`${responseVar}.methods.setupPlugin?.()`)
+    vmSetupMsSummary.labels(String(pluginConfig.plugin?.id)).observe(new Date().getTime() - timer.getTime())
 
     return {
         vm,
         methods,
         tasks,
+        vmResponseVariable: responseVar,
+        usedImports,
     }
 }

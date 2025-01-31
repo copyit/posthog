@@ -1,94 +1,62 @@
-import { Kafka, logLevel } from 'kafkajs'
+import { CompressionCodecs, CompressionTypes, Kafka, logLevel } from 'kafkajs'
+import SnappyCodec from 'kafkajs-snappy'
 
 import { defaultConfig, overrideWithEnv } from '../../src/config/config'
 import {
-    KAFKA_EVENTS,
+    KAFKA_BUFFER,
+    KAFKA_EVENTS_JSON,
     KAFKA_EVENTS_PLUGIN_INGESTION,
     KAFKA_GROUPS,
+    KAFKA_PERFORMANCE_EVENTS,
     KAFKA_PERSON,
+    KAFKA_PERSON_DISTINCT_ID,
     KAFKA_PERSON_UNIQUE_ID,
     KAFKA_PLUGIN_LOG_ENTRIES,
-    KAFKA_SESSION_RECORDING_EVENTS,
+    KAFKA_SESSION_RECORDING_SNAPSHOT_ITEM_EVENTS,
 } from '../../src/config/kafka-topics'
 import { PluginsServerConfig } from '../../src/types'
-import { delay, UUIDT } from '../../src/utils/utils'
 import { KAFKA_EVENTS_DEAD_LETTER_QUEUE } from './../../src/config/kafka-topics'
 
-/** Clear the kafka queue */
-export async function resetKafka(extraServerConfig: Partial<PluginsServerConfig>, delayMs = 2000): Promise<true> {
-    console.log('Resetting Kafka!')
+CompressionCodecs[CompressionTypes.Snappy] = SnappyCodec
+
+/** Clear the Kafka queue and return Kafka object */
+export async function resetKafka(extraServerConfig?: Partial<PluginsServerConfig>): Promise<Kafka> {
     const config = { ...overrideWithEnv(defaultConfig, process.env), ...extraServerConfig }
     const kafka = new Kafka({
-        clientId: `plugin-server-test-${new UUIDT()}`,
+        clientId: `plugin-server-test`,
         brokers: (config.KAFKA_HOSTS || '').split(','),
         logLevel: logLevel.WARN,
     })
-    const producer = kafka.producer()
-    const consumer = kafka.consumer({
-        groupId: 'clickhouse-ingestion-test',
-    })
-    const messages = []
 
     await createTopics(kafka, [
-        KAFKA_EVENTS,
+        KAFKA_EVENTS_JSON,
         KAFKA_EVENTS_PLUGIN_INGESTION,
+        KAFKA_BUFFER,
         KAFKA_GROUPS,
-        KAFKA_SESSION_RECORDING_EVENTS,
+        KAFKA_SESSION_RECORDING_SNAPSHOT_ITEM_EVENTS,
+        KAFKA_PERFORMANCE_EVENTS,
         KAFKA_PERSON,
         KAFKA_PERSON_UNIQUE_ID,
+        KAFKA_PERSON_DISTINCT_ID,
         KAFKA_PLUGIN_LOG_ENTRIES,
         KAFKA_EVENTS_DEAD_LETTER_QUEUE,
     ])
 
-    await new Promise<void>(async (resolve, reject) => {
-        console.info('setting group join and crash listeners')
-        const { CONNECT, GROUP_JOIN, CRASH } = consumer.events
-        consumer.on(CONNECT, () => {
-            console.log('consumer connected to kafka')
-        })
-        consumer.on(GROUP_JOIN, () => {
-            console.log('joined group')
-            resolve()
-        })
-        consumer.on(CRASH, ({ payload: { error } }) => reject(error))
-
-        console.info('connecting producer')
-        await producer.connect()
-
-        console.info('subscribing consumer')
-        await consumer.subscribe({ topic: KAFKA_EVENTS_PLUGIN_INGESTION })
-
-        console.info('running consumer')
-        await consumer.run({
-            eachMessage: async (payload) => {
-                await Promise.resolve()
-                console.info('message received!')
-                messages.push(payload)
-            },
-        })
-
-        console.info(`awaiting ${delayMs} ms before disconnecting`)
-        await delay(delayMs)
-
-        console.info('disconnecting producer')
-        await producer.disconnect()
-
-        console.info('stopping consumer')
-        await consumer.stop()
-
-        console.info('disconnecting consumer')
-        await consumer.disconnect()
-    })
-
-    return true
+    return kafka
 }
 
-async function createTopics(kafka: Kafka, topics: string[]) {
+export async function createTopics(kafka: Kafka, topics: string[]) {
     const admin = kafka.admin()
     await admin.connect()
-    await admin.createTopics({
-        waitForLeaders: true,
-        topics: topics.map((topic) => ({ topic })),
-    })
+
+    const existingTopics = await admin.listTopics()
+    const topicsToCreate = topics.filter((topic) => !existingTopics.includes(topic)).map((topic) => ({ topic }))
+
+    if (topicsToCreate.length > 0) {
+        await admin.createTopics({
+            waitForLeaders: true,
+            topics: topicsToCreate,
+        })
+    }
     await admin.disconnect()
 }

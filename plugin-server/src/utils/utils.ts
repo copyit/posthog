@@ -1,22 +1,26 @@
-import Piscina from '@posthog/piscina'
-import { PluginEvent } from '@posthog/plugin-scaffold'
+import { Properties } from '@posthog/plugin-scaffold'
 import * as Sentry from '@sentry/node'
-import AdmZip from 'adm-zip'
 import { randomBytes } from 'crypto'
-import Redis, { RedisOptions } from 'ioredis'
+import crypto from 'crypto'
 import { DateTime } from 'luxon'
-import { Pool, PoolConfig } from 'pg'
+import { Pool } from 'pg'
 import { Readable } from 'stream'
-import * as tar from 'tar-stream'
-import * as zlib from 'zlib'
 
-import { LogLevel, Plugin, PluginConfigId, PluginsServerConfig, TimestampFormat } from '../types'
+import {
+    ClickHouseTimestamp,
+    ClickHouseTimestampSecondPrecision,
+    ISOTimestamp,
+    Plugin,
+    PluginConfigId,
+    PluginsServerConfig,
+    TimestampFormat,
+} from '../types'
 import { status } from './status'
 
 /** Time until autoexit (due to error) gives up on graceful exit and kills the process right away. */
 const GRACEFUL_EXIT_PERIOD_SECONDS = 5
-/** Number of Redis error events until the server is killed gracefully. */
-const REDIS_ERROR_COUNTER_LIMIT = 10
+
+export class NoRowsUpdatedError extends Error {}
 
 export function killGracefully(): void {
     status.error('⏲', 'Shutting plugin server down gracefully with SIGTERM...')
@@ -42,104 +46,44 @@ export function bufferToStream(binary: Buffer): Readable {
     return readableInstanceStream
 }
 
-export async function getFileFromArchive(archive: Buffer, file: string): Promise<string | null> {
-    try {
-        return getFileFromZip(archive, file)
-    } catch (e) {
-        try {
-            return await getFileFromTGZ(archive, file)
-        } catch (e) {
-            throw new Error(`Could not read archive as .zip or .tgz`)
-        }
-    }
-}
+export function base64StringToUint32ArrayLE(base64: string): Uint32Array {
+    const buffer = Buffer.from(base64, 'base64')
+    const dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+    const length = buffer.byteLength / 4
+    const result = new Uint32Array(length)
 
-export async function getFileFromTGZ(archive: Buffer, file: string): Promise<string | null> {
-    const response = await new Promise((resolve: (value: string | null) => void, reject: (error?: Error) => void) => {
-        const stream = bufferToStream(archive)
-        const extract = tar.extract()
-
-        let rootPath: string | null = null
-        let fileData: string | null = null
-
-        extract.on('entry', (header, stream, next) => {
-            if (rootPath === null) {
-                const rootPathArray = header.name.split('/')
-                rootPathArray.pop()
-                rootPath = rootPathArray.join('/')
-            }
-            if (header.name == `${rootPath}/${file}`) {
-                stream.on('data', (chunk) => {
-                    if (fileData === null) {
-                        fileData = ''
-                    }
-                    fileData += chunk
-                })
-            }
-            stream.on('end', () => next())
-            stream.resume() // just auto drain the stream
-        })
-
-        extract.on('finish', function () {
-            resolve(fileData)
-        })
-
-        extract.on('error', reject)
-
-        const unzipStream = zlib.createUnzip()
-        unzipStream.on('error', reject)
-
-        stream.pipe(unzipStream).pipe(extract)
-    })
-
-    return response
-}
-
-export function getFileFromZip(archive: Buffer, file: string): string | null {
-    const zip = new AdmZip(archive)
-    const zipEntries = zip.getEntries() // an array of ZipEntry records
-    let fileData
-
-    if (zipEntries[0].entryName.endsWith('/')) {
-        // if first entry is `pluginfolder/` (a folder!)
-        const root = zipEntries[0].entryName
-        fileData = zip.getEntry(`${root}${file}`)
-    } else {
-        // if first entry is `pluginfolder/index.js` (or whatever file)
-        const rootPathArray = zipEntries[0].entryName.split('/')
-        rootPathArray.pop()
-        const root = rootPathArray.join('/')
-        fileData = zip.getEntry(`${root}/${file}`)
+    for (let i = 0; i < length; i++) {
+        // explicitly set little-endian
+        result[i] = dataView.getUint32(i * 4, true)
     }
 
-    if (fileData) {
-        return fileData.getData().toString()
-    }
-
-    return null
+    return result
 }
 
-export function setLogLevel(logLevel: LogLevel): void {
-    for (const loopLevel of ['debug', 'info', 'log', 'warn', 'error']) {
-        if (loopLevel === logLevel) {
-            break
-        }
-        const logFunction = (console as any)[loopLevel]
-        if (logFunction) {
-            const originalFunction = logFunction._original || logFunction
-            // eslint-disable-next-line @typescript-eslint/no-empty-function
-            ;(console as any)[loopLevel] = () => {}
-            ;(console as any)[loopLevel]._original = originalFunction
-        }
+export function uint32ArrayLEToBase64String(uint32Array: Uint32Array): string {
+    const buffer = new ArrayBuffer(uint32Array.length * 4)
+    const dataView = new DataView(buffer)
+
+    for (let i = 0; i < uint32Array.length; i++) {
+        // explicitly set little-endian
+        dataView.setUint32(i * 4, uint32Array[i], true)
     }
+
+    return Buffer.from(buffer).toString('base64')
 }
 
-export function cloneObject<T extends any | any[]>(obj: T): T {
+export function createRandomUint32x4(): Uint32Array {
+    const randomArray = new Uint32Array(4)
+    crypto.webcrypto.getRandomValues(randomArray)
+    return randomArray
+}
+
+export function cloneObject<T>(obj: T): T {
     if (obj !== Object(obj)) {
         return obj
     }
     if (Array.isArray(obj)) {
-        return obj.map(cloneObject) as T
+        return (obj as any[]).map(cloneObject) as unknown as T
     }
     const clone: Record<string, any> = {}
     for (const i in obj) {
@@ -161,7 +105,7 @@ export class UUID {
      * This does not care about RFC4122, since neither does UUIDT above.
      * https://stackoverflow.com/questions/7905929/how-to-test-valid-uuid-guid
      */
-    // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
+
     static validateString(candidate: any, throwOnInvalid = true): boolean {
         const isValid = Boolean(
             candidate &&
@@ -196,7 +140,7 @@ export class UUID {
     }
 
     /** Convert to 128-bit BigInt. */
-    valueOf(): BigInt {
+    valueOf(): bigint {
         let value = 0n
         for (const byte of this.array) {
             value <<= 8n
@@ -300,11 +244,73 @@ export class UUIDT extends UUID {
     }
 }
 
-/** Format timestamp for ClickHouse. */
+export class UUID7 extends UUID {
+    constructor(bufferOrUnixTimeMs?: number | Buffer, rand?: Buffer) {
+        if (bufferOrUnixTimeMs instanceof Buffer) {
+            if (bufferOrUnixTimeMs.length !== 16) {
+                throw new Error(`UUID7 from buffer requires 16 bytes, got ${bufferOrUnixTimeMs.length}`)
+            }
+            super(bufferOrUnixTimeMs)
+            return
+        }
+        const unixTimeMs = bufferOrUnixTimeMs ?? DateTime.utc().toMillis()
+        let unixTimeMsBig = BigInt(unixTimeMs)
+
+        if (!rand) {
+            rand = randomBytes(10)
+        } else if (rand.length !== 10) {
+            throw new Error(`UUID7 requires 10 bytes of random data, got ${rand.length}`)
+        }
+
+        // see https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7
+        // a UUIDv7 is 128 bits (16 bytes) total
+        // 48 bits for unix_ts_ms,
+        // 4 bits for ver = 0b111 (7)
+        // 12 bits for rand_a
+        // 2 bits for var = 0b10
+        // 62 bits for rand_b
+        // we set fully random values for rand_a and rand_b
+
+        const array = new Uint8Array(16)
+        // 48 bits for time, WILL FAIL in 10 895 CE
+        // XXXXXXXX-XXXX-****-****-************
+        for (let i = 5; i >= 0; i--) {
+            array[i] = Number(unixTimeMsBig & 0xffn) // use last 8 binary digits to set UUID 2 hexadecimal digits
+            unixTimeMsBig >>= 8n // remove these last 8 binary digits
+        }
+        // rand_a and rand_b
+        // ********-****-*XXX-XXXX-XXXXXXXXXXXX
+        array.set(rand, 6)
+
+        // ver and var
+        // ********-****-7***-X***-************
+        array[6] = 0b0111_0000 | (array[6] & 0b0000_1111)
+        array[8] = 0b1000_0000 | (array[8] & 0b0011_1111)
+
+        super(array)
+    }
+}
+
+/* Format timestamps.
+Allowed timestamp formats support ISO and ClickHouse formats according to
+`timestampFormat`. This distinction is relevant because ClickHouse does NOT
+ necessarily accept all possible ISO timestamps. */
+export function castTimestampOrNow(
+    timestamp?: DateTime | string | null,
+    timestampFormat?: TimestampFormat.ISO
+): ISOTimestamp
+export function castTimestampOrNow(
+    timestamp: DateTime | string | null,
+    timestampFormat: TimestampFormat.ClickHouse
+): ClickHouseTimestamp
+export function castTimestampOrNow(
+    timestamp: DateTime | string | null,
+    timestampFormat: TimestampFormat.ClickHouseSecondPrecision
+): ClickHouseTimestampSecondPrecision
 export function castTimestampOrNow(
     timestamp?: DateTime | string | null,
     timestampFormat: TimestampFormat = TimestampFormat.ISO
-): string {
+): ISOTimestamp | ClickHouseTimestamp | ClickHouseTimestampSecondPrecision {
     if (!timestamp) {
         timestamp = DateTime.utc()
     } else if (typeof timestamp === 'string') {
@@ -314,25 +320,52 @@ export function castTimestampOrNow(
     return castTimestampToClickhouseFormat(timestamp, timestampFormat)
 }
 
+const DATETIME_FORMAT_CLICKHOUSE_SECOND_PRECISION = 'yyyy-MM-dd HH:mm:ss'
+const DATETIME_FORMAT_CLICKHOUSE = 'yyyy-MM-dd HH:mm:ss.u'
+
+export function castTimestampToClickhouseFormat(timestamp: DateTime, timestampFormat: TimestampFormat.ISO): ISOTimestamp
+export function castTimestampToClickhouseFormat(
+    timestamp: DateTime,
+    timestampFormat: TimestampFormat.ClickHouse
+): ClickHouseTimestamp
+export function castTimestampToClickhouseFormat(
+    timestamp: DateTime,
+    timestampFormat: TimestampFormat.ClickHouseSecondPrecision
+): ClickHouseTimestampSecondPrecision
+export function castTimestampToClickhouseFormat(
+    timestamp: DateTime,
+    timestampFormat: TimestampFormat
+): ISOTimestamp | ClickHouseTimestamp | ClickHouseTimestampSecondPrecision
 export function castTimestampToClickhouseFormat(
     timestamp: DateTime,
     timestampFormat: TimestampFormat = TimestampFormat.ISO
-): string {
+): ISOTimestamp | ClickHouseTimestamp | ClickHouseTimestampSecondPrecision {
     timestamp = timestamp.toUTC()
     switch (timestampFormat) {
         case TimestampFormat.ClickHouseSecondPrecision:
-            return timestamp.toFormat('yyyy-MM-dd HH:mm:ss')
+            return timestamp.toFormat(DATETIME_FORMAT_CLICKHOUSE_SECOND_PRECISION) as ClickHouseTimestampSecondPrecision
         case TimestampFormat.ClickHouse:
-            return timestamp.toFormat('yyyy-MM-dd HH:mm:ss.u')
+            return timestamp.toFormat(DATETIME_FORMAT_CLICKHOUSE) as ClickHouseTimestamp
         case TimestampFormat.ISO:
-            return timestamp.toUTC().toISO()
+            return timestamp.toUTC().toISO() as ISOTimestamp
         default:
             throw new Error(`Unrecognized timestamp format ${timestampFormat}!`)
     }
 }
 
-export function clickHouseTimestampToISO(timestamp: string): string {
-    return DateTime.fromFormat(timestamp, 'yyyy-MM-dd HH:mm:ss.u', { zone: 'UTC' }).toISO()
+// Used only when parsing clickhouse timestamps
+export function clickHouseTimestampToDateTime(timestamp: ClickHouseTimestamp): DateTime {
+    return DateTime.fromFormat(timestamp, DATETIME_FORMAT_CLICKHOUSE, { zone: 'UTC' })
+}
+
+export function clickHouseTimestampToISO(timestamp: ClickHouseTimestamp): ISOTimestamp {
+    return clickHouseTimestampToDateTime(timestamp).toISO() as ISOTimestamp
+}
+
+export function clickHouseTimestampSecondPrecisionToISO(timestamp: ClickHouseTimestamp): ISOTimestamp {
+    return DateTime.fromFormat(timestamp, DATETIME_FORMAT_CLICKHOUSE_SECOND_PRECISION, {
+        zone: 'UTC',
+    }).toISO() as ISOTimestamp
 }
 
 export function delay(ms: number): Promise<void> {
@@ -353,14 +386,6 @@ export function escapeClickHouseString(string: string): string {
     return string.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
 }
 
-export function groupIntoBatches<T>(array: T[], batchSize: number): T[][] {
-    const batches = []
-    for (let i = 0; i < array.length; i += batchSize) {
-        batches.push(array.slice(i, i + batchSize))
-    }
-    return batches
-}
-
 /** Standardize JS code used internally to form without extraneous indentation. Template literal function. */
 export function code(strings: TemplateStringsArray): string {
     const stringsConcat = strings.join('…')
@@ -369,11 +394,7 @@ export function code(strings: TemplateStringsArray): string {
     return dedentedCode.trim()
 }
 
-export async function tryTwice<T extends any>(
-    callback: () => Promise<T>,
-    errorMessage: string,
-    timeoutMs = 5000
-): Promise<T> {
+export async function tryTwice<T>(callback: () => Promise<T>, errorMessage: string, timeoutMs = 5000): Promise<T> {
     const timeout = new Promise((_, reject) => setTimeout(reject, timeoutMs))
     try {
         const response = await Promise.race([timeout, callback()])
@@ -385,40 +406,10 @@ export async function tryTwice<T extends any>(
     }
 }
 
-export async function createRedis(serverConfig: PluginsServerConfig): Promise<Redis.Redis> {
-    const credentials: Partial<RedisOptions> | undefined = serverConfig.POSTHOG_REDIS_HOST
-        ? {
-              password: serverConfig.POSTHOG_REDIS_PASSWORD,
-              port: serverConfig.POSTHOG_REDIS_PORT,
-          }
-        : undefined
-
-    const redis = new Redis(credentials ? serverConfig.POSTHOG_REDIS_HOST : serverConfig.REDIS_URL, {
-        ...credentials,
-        maxRetriesPerRequest: -1,
-    })
-    let errorCounter = 0
-    redis
-        .on('error', (error) => {
-            errorCounter++
-            Sentry.captureException(error)
-            if (errorCounter > REDIS_ERROR_COUNTER_LIMIT) {
-                status.error('😡', 'Redis error encountered! Enough of this, I quit!\n', error)
-                killGracefully()
-            } else {
-                status.error('🔴', 'Redis error encountered! Trying to reconnect...\n', error)
-            }
-        })
-        .on('ready', () => {
-            if (process.env.NODE_ENV !== 'test') {
-                status.info('✅', 'Connected to Redis!')
-            }
-        })
-    await redis.info()
-    return redis
-}
-
-export function pluginDigest(plugin: Plugin, teamId?: number): string {
+export function pluginDigest(plugin: Plugin | Plugin['id'], teamId?: number): string {
+    if (typeof plugin === 'number') {
+        return `plugin ID ${plugin} (unknown)`
+    }
     const extras = []
     if (teamId) {
         extras.push(`team ID ${teamId}`)
@@ -431,35 +422,16 @@ export function pluginDigest(plugin: Plugin, teamId?: number): string {
 }
 
 export function createPostgresPool(
-    configOrDatabaseUrl: PluginsServerConfig | string,
+    connectionString: string,
+    poolSize: number,
+    applicationName: string,
     onError?: (error: Error) => any
 ): Pool {
-    if (typeof configOrDatabaseUrl !== 'string') {
-        if (!configOrDatabaseUrl.DATABASE_URL && !configOrDatabaseUrl.POSTHOG_DB_NAME) {
-            throw new Error('Invalid configuration for Postgres: either DATABASE_URL or POSTHOG_DB_NAME required')
-        }
-    }
-    const credentials: Partial<PoolConfig> =
-        typeof configOrDatabaseUrl === 'string'
-            ? {
-                  connectionString: configOrDatabaseUrl,
-              }
-            : configOrDatabaseUrl.DATABASE_URL
-            ? {
-                  connectionString: configOrDatabaseUrl.DATABASE_URL,
-              }
-            : {
-                  database: configOrDatabaseUrl.POSTHOG_DB_NAME ?? undefined,
-                  user: configOrDatabaseUrl.POSTHOG_DB_USER,
-                  password: configOrDatabaseUrl.POSTHOG_DB_PASSWORD,
-                  host: configOrDatabaseUrl.POSTHOG_POSTGRES_HOST,
-                  port: configOrDatabaseUrl.POSTHOG_POSTGRES_PORT,
-              }
-
     const pgPool = new Pool({
-        ...credentials,
+        connectionString,
         idleTimeoutMillis: 500,
-        max: 10,
+        application_name: applicationName,
+        max: poolSize,
         ssl: process.env.DYNO // Means we are on Heroku
             ? {
                   rejectUnauthorized: false,
@@ -479,77 +451,6 @@ export function createPostgresPool(
     return pgPool
 }
 
-export function sanitizeEvent(event: PluginEvent): PluginEvent {
-    event.distinct_id = event.distinct_id?.toString()
-    return event
-}
-
-export enum NodeEnv {
-    Development = 'dev',
-    Production = 'prod',
-    Test = 'test',
-}
-
-export function stringToBoolean(value: unknown, strict?: false): boolean
-export function stringToBoolean(value: unknown, strict: true): boolean | null
-export function stringToBoolean(value: unknown, strict = false): boolean | null {
-    const stringValue = String(value).toLowerCase()
-    const isStrictlyTrue = ['y', 'yes', 't', 'true', 'on', '1'].includes(stringValue)
-    if (isStrictlyTrue) {
-        return true
-    }
-    if (strict) {
-        const isStrictlyFalse = ['n', 'no', 'f', 'false', 'off', '0'].includes(stringValue)
-        return isStrictlyFalse ? false : null
-    }
-    return false
-}
-
-export function determineNodeEnv(): NodeEnv {
-    let nodeEnvRaw = process.env.NODE_ENV
-    if (nodeEnvRaw) {
-        nodeEnvRaw = nodeEnvRaw.toLowerCase()
-        if (nodeEnvRaw.startsWith(NodeEnv.Test)) {
-            return NodeEnv.Test
-        }
-        if (nodeEnvRaw.startsWith(NodeEnv.Development)) {
-            return NodeEnv.Development
-        }
-    }
-    if (stringToBoolean(process.env.DEBUG)) {
-        return NodeEnv.Development
-    }
-    return NodeEnv.Production
-}
-
-export function getPiscinaStats(piscina: Piscina): Record<string, number> {
-    return {
-        utilization: (piscina.utilization || 0) * 100,
-        threads: piscina.threads.length,
-        queue_size: piscina.queueSize,
-        'waitTime.average': piscina.waitTime.average,
-        'waitTime.mean': piscina.waitTime.mean,
-        'waitTime.stddev': piscina.waitTime.stddev,
-        'waitTime.min': piscina.waitTime.min,
-        'waitTime.p99_99': piscina.waitTime.p99_99,
-        'waitTime.p99': piscina.waitTime.p99,
-        'waitTime.p95': piscina.waitTime.p95,
-        'waitTime.p90': piscina.waitTime.p90,
-        'waitTime.p75': piscina.waitTime.p75,
-        'waitTime.p50': piscina.waitTime.p50,
-        'runTime.average': piscina.runTime.average,
-        'runTime.mean': piscina.runTime.mean,
-        'runTime.stddev': piscina.runTime.stddev,
-        'runTime.min': piscina.runTime.min,
-        'runTime.p99_99': piscina.runTime.p99_99,
-        'runTime.p99': piscina.runTime.p99,
-        'runTime.p95': piscina.runTime.p95,
-        'runTime.p90': piscina.runTime.p90,
-        'runTime.p75': piscina.runTime.p75,
-        'runTime.p50': piscina.runTime.p50,
-    }
-}
-
 export function pluginConfigIdFromStack(
     stack: string,
     pluginConfigSecretLookup: Map<string, PluginConfigId>
@@ -557,7 +458,7 @@ export function pluginConfigIdFromStack(
     // This matches `pluginConfigIdentifier` from worker/vm/vm.ts
     // For example: "at __asyncGuard__PluginConfig_39_3af03d... (vm.js:11..."
     const regexp = /at __[a-zA-Z0-9]+__PluginConfig_([0-9]+)_([0-9a-f]+) \(vm\.js\:/
-    const [_, id, hash] =
+    const [, id, hash] =
         stack
             .split('\n')
             .map((l) => l.match(regexp))
@@ -601,7 +502,7 @@ export function groupBy<T extends Record<string, any>, K extends keyof T>(
         ? objects.reduce((grouping, currentItem) => {
               if (currentItem[key] in grouping) {
                   throw new Error(
-                      `Key "${key}" has more than one matching value, which is not allowed in flat groupBy!`
+                      `Key "${String(key)}" has more than one matching value, which is not allowed in flat groupBy!`
                   )
               }
               grouping[currentItem[key]] = currentItem
@@ -622,7 +523,6 @@ export function stringClamp(value: string, def: number, min: number, max: number
     return clamp(nanToNull(parseInt(value)) ?? def, min, max)
 }
 
-// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
 export function stringify(value: any): string {
     switch (typeof value) {
         case 'string':
@@ -697,4 +597,117 @@ export function intToBase(num: number, base: number): string {
 // concerning race conditions across threads
 export class RaceConditionError extends Error {
     name = 'RaceConditionError'
+}
+
+/** Get a value from a properties object by its path. This allows accessing nested properties. */
+export function getPropertyValueByPath(properties: Properties, [firstKey, ...nestedKeys]: string[]): any {
+    if (firstKey === undefined) {
+        throw new Error('No path to property was provided')
+    }
+    let value = properties[firstKey]
+    for (const key of nestedKeys) {
+        if (value === undefined) {
+            return undefined
+        }
+        value = value[key]
+    }
+    return value
+}
+
+export async function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Values of the $lib property that have been seen in the wild
+export const KNOWN_LIB_VALUES = new Set([
+    'web',
+    'posthog-python',
+    '',
+    'js',
+    'posthog-node',
+    'posthog-react-native',
+    'posthog-ruby',
+    'posthog-ios',
+    'posthog-android',
+    'Segment',
+    'posthog-go',
+    'analytics-node',
+    'RudderLabs JavaScript SDK',
+    'mobile',
+    'posthog-php',
+    'zapier',
+    'Webflow',
+    'posthog-flutter',
+    'com.rudderstack.android.sdk.core',
+    'rudder-analytics-python',
+    'rudder-ios-library',
+    'rudder-analytics-php',
+    'macos',
+    'service_data',
+    'flow',
+    'PROD',
+    'unknown',
+    'api',
+    'unbounce',
+    'backend',
+    'analytics-python',
+    'windows',
+    'cf-analytics-go',
+    'server',
+    'core',
+    'Marketing',
+    'Product',
+    'com.rudderstack.android.sdk',
+    'net-gibraltar',
+    'posthog-java',
+    'rudderanalytics-ruby',
+    'GSHEETS_AIRBYTE',
+    'posthog-plugin-server',
+    'DotPostHog',
+    'analytics-go',
+    'serverless',
+    'wordpress',
+    'hog_function',
+    'http',
+    'desktop',
+    'elixir',
+    'DEV',
+    'RudderAnalytics.NET',
+    'PR',
+    'railway',
+    'HTTP',
+    'extension',
+    'cyclotron-testing',
+    'RudderStack Shopify Cloud',
+    'GSHEETS_MONITOR',
+    'Rudder',
+    'API',
+    'rudder-sdk-ruby-sync',
+    'curl',
+])
+
+export const getKnownLibValueOrSentinel = (lib: string): string => {
+    if (lib === '') {
+        return '$empty'
+    }
+    if (!lib) {
+        return '$nil'
+    }
+    if (KNOWN_LIB_VALUES.has(lib)) {
+        return lib
+    }
+    return '$other'
+}
+
+// Check if 2 maps with primitive values are equal
+export const areMapsEqual = <K, V>(map1: Map<K, V>, map2: Map<K, V>): boolean => {
+    if (map1.size !== map2.size) {
+        return false
+    }
+    for (const [key, value] of map1) {
+        if (!map2.has(key) || map2.get(key) !== value) {
+            return false
+        }
+    }
+    return true
 }

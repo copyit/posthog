@@ -1,6 +1,5 @@
-import React from 'react'
-import { Button } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import { IconRefresh } from 'lib/lemon-ui/icons'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
 
 export function ErrorNetwork(): JSX.Element {
     return (
@@ -8,9 +7,9 @@ export function ErrorNetwork(): JSX.Element {
             <h1 className="page-title">Network Error</h1>
             <p>There was an issue loading the requested resource.</p>
             <p>
-                <Button onClick={() => window.location.reload()}>
-                    <ReloadOutlined /> Reload the page!
-                </Button>
+                <LemonButton type="primary" onClick={() => window.location.reload()} icon={<IconRefresh />}>
+                    Reload the page!
+                </LemonButton>
             </p>
         </div>
     )

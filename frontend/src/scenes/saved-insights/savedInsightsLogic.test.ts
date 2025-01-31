@@ -1,17 +1,26 @@
+import { router } from 'kea-router'
 import { expectLogic, partial } from 'kea-test-utils'
-import { initKeaTests } from '~/test/init'
-import { InsightsResult, savedInsightsLogic } from './savedInsightsLogic'
-import { DashboardItemType, InsightShortId, InsightType } from '~/types'
-import { combineUrl, router } from 'kea-router'
-import { defaultAPIMocks, MOCK_TEAM_ID, mockAPI } from 'lib/api.mock'
+import api from 'lib/api'
+import { MOCK_TEAM_ID } from 'lib/api.mock'
+import { DeleteDashboardForm, deleteDashboardLogic } from 'scenes/dashboard/deleteDashboardLogic'
+import { DuplicateDashboardForm, duplicateDashboardLogic } from 'scenes/dashboard/duplicateDashboardLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
 import { urls } from 'scenes/urls'
-import { cleanFilters } from 'scenes/insights/utils/cleanFilters'
 
-jest.mock('lib/api')
+import { useMocks } from '~/mocks/jest'
+import { dashboardsModel } from '~/models/dashboardsModel'
+import { initKeaTests } from '~/test/init'
+import { QueryBasedInsightModel } from '~/types'
 
-const Insight42 = 'ii42' as InsightShortId
+import { INSIGHTS_PER_PAGE, InsightsResult, savedInsightsLogic } from './savedInsightsLogic'
 
-const createInsight = (id: number, string = 'hi'): DashboardItemType =>
+jest.spyOn(api, 'create')
+
+const blankScene = (): any => ({ scene: { component: () => null, logic: null } })
+const scenes: any = { [Scene.SavedInsights]: blankScene }
+
+const createInsight = (id: number, string = 'hi'): QueryBasedInsightModel =>
     ({
         id: id || 1,
         name: `${string} ${id || 1}`,
@@ -24,43 +33,42 @@ const createInsight = (id: number, string = 'hi'): DashboardItemType =>
         is_sample: false,
         updated_at: 'now',
         result: {},
-        tags: [],
         color: null,
         created_at: 'now',
         dashboard: null,
         deleted: false,
         saved: true,
-        filters_hash: 'hash',
-        filters: {},
-    } as any as DashboardItemType)
-const createSavedInsights = (string = 'hello'): InsightsResult => ({
+        query: {},
+    } as any as QueryBasedInsightModel)
+const createSavedInsights = (string = 'hello', offset: number): InsightsResult => ({
     count: 3,
-    results: [createInsight(1, string), createInsight(2, string), createInsight(3, string)],
+    results: [createInsight(1, string), createInsight(2, string), createInsight(3, string)].slice(offset),
+    offset: 0,
 })
 
 describe('savedInsightsLogic', () => {
     let logic: ReturnType<typeof savedInsightsLogic.build>
 
-    mockAPI(async (url) => {
-        const {
-            pathname,
-            searchParams: { search },
-        } = url
-        if (pathname === `api/projects/${MOCK_TEAM_ID}/insights/`) {
-            return createSavedInsights(search)
-        }
-        if (pathname === `api/projects/${MOCK_TEAM_ID}/insights/42`) {
-            return createInsight(42)
-        }
-        if (pathname === `api/projects/${MOCK_TEAM_ID}/insights/123`) {
-            return createInsight(123)
-        }
-        return defaultAPIMocks(url)
-    })
-
     beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/': (req) => [
+                    200,
+                    createSavedInsights(
+                        req.url.searchParams.get('search') ?? '',
+                        parseInt(req.url.searchParams.get('offset') ?? '0')
+                    ),
+                ],
+                '/api/environments/:team_id/insights/42': createInsight(42),
+                '/api/environments/:team_id/insights/123': createInsight(123),
+            },
+            post: {
+                '/api/environments/:team_id/insights/': () => [200, createInsight(42)],
+            },
+        })
         initKeaTests()
-        router.actions.push(urls.savedInsights())
+        sceneLogic({ scenes }).mount()
+        router.actions.push(urls.project(MOCK_TEAM_ID, urls.savedInsights()))
         logic = savedInsightsLogic()
         logic.mount()
     })
@@ -70,7 +78,7 @@ describe('savedInsightsLogic', () => {
         await expectLogic(logic).toDispatchActions(['setSavedInsightsFilters', 'loadInsights', 'loadInsightsSuccess'])
     })
 
-    it('can filter the flags', async () => {
+    it('can filter the insights', async () => {
         // makes a search query
         logic.actions.setSavedInsightsFilters({ search: 'hello' })
         await expectLogic(logic)
@@ -80,6 +88,7 @@ describe('savedInsightsLogic', () => {
                 insights: {
                     results: partial([partial({ name: 'hello 1' })]),
                     count: 3,
+                    offset: 0,
                     filters: partial({ search: 'hello' }),
                 },
             })
@@ -93,6 +102,7 @@ describe('savedInsightsLogic', () => {
                 insights: {
                     results: partial([partial({ name: 'hello 1' })]),
                     count: 3,
+                    offset: 0,
                     filters: partial({ search: 'hello' }),
                 },
             })
@@ -106,6 +116,7 @@ describe('savedInsightsLogic', () => {
                 insights: {
                     results: partial([partial({ name: 'hello 1' })]),
                     count: 3,
+                    offset: 0,
                     filters: partial({ search: 'hello' }),
                 },
             })
@@ -115,7 +126,36 @@ describe('savedInsightsLogic', () => {
                 insights: {
                     results: partial([partial({ name: 'hello again 1' })]),
                     count: 3,
+                    offset: 0,
                     filters: partial({ search: 'hello again' }),
+                },
+            })
+    })
+
+    it('resets the page on filter change', async () => {
+        logic.actions.setSavedInsightsFilters({ page: 2 })
+        await expectLogic(logic)
+            .toDispatchActions(['loadInsights', 'loadInsightsSuccess'])
+            .toMatchValues({
+                filters: partial({ page: 2, search: '' }),
+                insights: {
+                    results: [],
+                    count: 3,
+                    offset: INSIGHTS_PER_PAGE,
+                    filters: partial({ page: 2, search: '' }),
+                },
+            })
+
+        logic.actions.setSavedInsightsFilters({ search: 'hello' })
+        await expectLogic(logic)
+            .toDispatchActions(['loadInsights', 'loadInsightsSuccess'])
+            .toMatchValues({
+                filters: partial({ page: 1, search: 'hello' }),
+                insights: {
+                    results: partial([partial({ name: 'hello 1' })]),
+                    count: 3,
+                    offset: 0,
+                    filters: partial({ page: 1, search: 'hello' }),
                 },
             })
     })
@@ -146,37 +186,57 @@ describe('savedInsightsLogic', () => {
             })
     })
 
-    describe('redirects old /insights urls to the real URL', () => {
-        it('in view mode with a #fromItem=', async () => {
-            router.actions.push(
-                combineUrl('/insights', cleanFilters({ insight: InsightType.TRENDS }), { fromItem: 42 }).url
-            )
-            await expectLogic(router)
-                .delay(1)
-                .toMatchValues({
-                    location: partial({ pathname: urls.insightView(Insight42) }),
-                    searchParams: partial({ insight: InsightType.TRENDS }),
-                })
+    it('can duplicate and does not use derived name for name', async () => {
+        const sourceInsight = createInsight(123, 'hello')
+        sourceInsight.name = ''
+        sourceInsight.derived_name = 'should be copied'
+        await logic.asyncActions.duplicateInsight(sourceInsight)
+        expect(api.create).toHaveBeenCalledWith(
+            `api/environments/${MOCK_TEAM_ID}/insights`,
+            expect.objectContaining({ name: '' }),
+            expect.objectContaining({})
+        )
+    })
+
+    it('can duplicate using name', async () => {
+        const sourceInsight = createInsight(123, 'hello')
+        sourceInsight.name = 'should be copied'
+        sourceInsight.derived_name = ''
+        await logic.asyncActions.duplicateInsight(sourceInsight)
+        expect(api.create).toHaveBeenCalledWith(
+            `api/environments/${MOCK_TEAM_ID}/insights`,
+            expect.objectContaining({ name: 'should be copied (copy)' }),
+            expect.objectContaining({})
+        )
+    })
+
+    describe('reacts to external updates', () => {
+        it('loads insights when a dashboard is duplicated', async () => {
+            await expectLogic(logic, () => {
+                duplicateDashboardLogic.actions.submitDuplicateDashboardSuccess({
+                    duplicateTiles: true,
+                } as DuplicateDashboardForm)
+            }).toDispatchActions(['loadInsights'])
         })
 
-        it('in edit mode with a #fromItem=', async () => {
-            router.actions.push(
-                combineUrl('/insights', cleanFilters({ insight: InsightType.TRENDS }), { fromItem: 42, edit: true }).url
-            )
-            await expectLogic(router)
-                .delay(1)
-                .toMatchValues({
-                    location: partial({ pathname: urls.insightEdit(Insight42) }),
-                    searchParams: partial({ insight: InsightType.TRENDS }),
-                })
+        it('loads insights when a dashboard is deleted', async () => {
+            await expectLogic(logic, () => {
+                deleteDashboardLogic.actions.submitDeleteDashboardSuccess({
+                    deleteInsights: true,
+                } as DeleteDashboardForm)
+            }).toDispatchActions(['loadInsights'])
         })
 
-        it('new mode with ?insight= and no hash params', async () => {
-            router.actions.push(combineUrl('/insights', cleanFilters({ insight: InsightType.FUNNELS })).url)
-            await expectLogic(router).toMatchValues({
-                location: partial({ pathname: urls.insightNew() }),
-                searchParams: partial({ insight: InsightType.FUNNELS }),
-            })
+        it('updates the list when an insight is changed', async () => {
+            await expectLogic(logic, () => {
+                dashboardsModel.actions.updateDashboardInsight(createInsight(1, 'a new name'))
+            }).toDispatchActions(['updateInsight'])
+        })
+
+        it('adds to the list when a new insight is reported as changed', async () => {
+            await expectLogic(logic, () => {
+                dashboardsModel.actions.updateDashboardInsight(createInsight(100, 'a new insight'))
+            }).toDispatchActions(['addInsight'])
         })
     })
 })

@@ -1,29 +1,150 @@
-// EmptyStates.stories.tsx
-import React from 'react'
-import { Meta } from '@storybook/react'
-import { keaStory } from 'lib/storybook/kea-story'
+import { Meta, StoryFn, StoryObj } from '@storybook/react'
+import { router } from 'kea-router'
+import { useEffect } from 'react'
+import { App } from 'scenes/App'
+import { createInsightStory } from 'scenes/insights/__mocks__/createInsightScene'
 
-// import the insight container
-import { Insight } from '../Insight'
-import { Dashboard } from 'scenes/dashboard/Dashboard'
+import { useStorybookMocks } from '~/mocks/browser'
+import { InsightShortId } from '~/types'
 
-// import the `getReduxState()` output for all the variations you wish to show
-import funnelSingleStepState from './funnel-single-step-state.json'
-import funnelInvalidExclusionState from './funnel-invalid-exclusion-state.json'
-import emptyState from './empty-state.json'
-import errorState from './error-state.json'
-import timeoutState from './timeout-state.json'
-import dashboardInsightEmptyState from './dashboard-insight-empty-state.json'
+import insight from '../../../mocks/fixtures/api/projects/team_id/insights/trendsLine.json'
+import { insightVizDataLogic } from '../insightVizDataLogic'
+import funnelOneStep from './funnelOneStep.json'
 
-// some metadata and optional parameters
-export default {
-    title: 'PostHog/Scenes/Insights/Error states',
-} as Meta
+type Story = StoryObj<typeof App>
+const meta: Meta = {
+    title: 'Scenes-App/Insights/Error & Empty States',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        testOptions: {
+            waitForSelector: '.empty-state-inner',
+        },
+    },
+}
+export default meta
 
-// export more stories with different state
-export const EmptyState = keaStory(Insight, emptyState)
-export const ErrorState = keaStory(Insight, errorState)
-export const TimeoutState = keaStory(Insight, timeoutState)
-export const FunelSingleStep = keaStory(Insight, funnelSingleStepState)
-export const FunnelInvalidExclusion = keaStory(Insight, funnelInvalidExclusionState)
-export const DashboardInsightEmptyState = keaStory(() => <Dashboard id="3" />, dashboardInsightEmptyState)
+export const Empty: StoryFn = () => {
+    useStorybookMocks({
+        get: {
+            '/api/environments/:team_id/insights/': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(200),
+                ctx.json({ count: 1, results: [{ ...insight, result: [] }] }),
+            ],
+        },
+    })
+    useEffect(() => {
+        router.actions.push(`/insights/${insight.short_id}`)
+    }, [])
+    return <App />
+}
+
+export const ServerError: StoryFn = () => {
+    useStorybookMocks({
+        get: {
+            '/api/environments/:team_id/insights/': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(200),
+                ctx.json({ count: 1, results: [{ ...insight, result: null }] }),
+            ],
+            '/api/environments/:team_id/insights/:id': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(500),
+                ctx.json({
+                    type: 'server_error',
+                    detail: 'There is nothing you can do to stop the impending catastrophe.',
+                }),
+            ],
+        },
+    })
+    useEffect(() => {
+        router.actions.push(`/insights/${insight.short_id}`)
+    }, [])
+    return <App />
+}
+
+export const ValidationError: StoryFn = () => {
+    useStorybookMocks({
+        get: {
+            '/api/environments/:team_id/insights/': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(200),
+                ctx.json({ count: 1, results: [{ ...insight, result: null }] }),
+            ],
+        },
+        post: {
+            '/api/environments/:team_id/insights/:id': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(400),
+                ctx.json({
+                    type: 'validation_error',
+                    detail: 'You forgot to hug the person next to you. Please do that now.',
+                }),
+            ],
+        },
+    })
+    useEffect(() => {
+        router.actions.push(`/insights/${insight.short_id}`)
+    }, [])
+    return <App />
+}
+
+export const EstimatedQueryExecutionTimeTooLong: StoryFn = () => {
+    useStorybookMocks({
+        get: {
+            '/api/environments/:team_id/insights/': (_, __, ctx) => [
+                ctx.status(200),
+                ctx.json({ count: 1, results: [{ ...insight, result: null }] }),
+            ],
+        },
+        post: {
+            '/api/environments/:team_id/query/': (_, __, ctx) => [
+                ctx.delay(100),
+                ctx.status(512),
+                ctx.json({
+                    type: 'server_error',
+                    detail: 'Estimated query execution time is too long. Try reducing its scope by changing the time range.',
+                }),
+            ],
+        },
+    })
+    useEffect(() => {
+        router.actions.push(`/insights/${insight.short_id}`)
+    }, [])
+    return <App />
+}
+EstimatedQueryExecutionTimeTooLong.parameters = {
+    testOptions: {
+        waitForLoadersToDisappear: false,
+        waitForSelector: '[data-attr=insight-loading-too-long]',
+    },
+}
+
+export const LongLoading: StoryFn = () => {
+    useStorybookMocks({
+        get: {
+            '/api/environments/:team_id/insights/': (_, __, ctx) => [
+                ctx.status(200),
+                ctx.json({ count: 1, results: [{ ...insight, result: null }] }),
+            ],
+        },
+        post: {
+            '/api/environments/:team_id/query/': (_, __, ctx) => [ctx.delay('infinite')],
+        },
+    })
+    useEffect(() => {
+        router.actions.push(`/insights/${insight.short_id}`)
+        const logic = insightVizDataLogic.findMounted({ dashboardItemId: insight.short_id as InsightShortId })
+        logic?.actions.setTimedOutQueryId('a-uuid-query-id') // Show the suggestions immediately
+    }, [])
+    return <App />
+}
+LongLoading.parameters = {
+    testOptions: {
+        waitForLoadersToDisappear: false,
+        waitForSelector: '[data-attr=insight-loading-waiting-message]',
+    },
+}
+
+export const FunnelSingleStep: Story = createInsightStory(funnelOneStep as any)

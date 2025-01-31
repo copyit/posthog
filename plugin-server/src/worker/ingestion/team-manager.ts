@@ -1,100 +1,147 @@
 import { Properties } from '@posthog/plugin-scaffold'
+import LRU from 'lru-cache'
 
-import { Team, TeamId } from '../../types'
-import { DB } from '../../utils/db/db'
+import { ONE_MINUTE } from '../../config/constants'
+import { TeamIDWithConfig } from '../../main/ingestion-queues/session-recording/session-recordings-consumer'
+import { PipelineEvent, PluginsServerConfig, ProjectId, Team, TeamId } from '../../types'
+import { PostgresRouter, PostgresUse } from '../../utils/db/postgres'
 import { timeoutGuard } from '../../utils/db/utils'
 import { posthog } from '../../utils/posthog'
-import { getByAge, UUIDT } from '../../utils/utils'
-
-type TeamCache<T> = Map<TeamId, [T, number]>
 
 export class TeamManager {
-    db: DB
-    teamCache: TeamCache<Team | null>
-    eventNamesCache: Map<TeamId, Set<string>>
-    eventPropertiesCache: Map<TeamId, Set<string>>
+    postgres: PostgresRouter
+    teamCache: LRU<TeamId, Team | null>
+    tokenToTeamIdCache: LRU<string, TeamId | null>
     instanceSiteUrl: string
 
-    constructor(db: DB, instanceSiteUrl?: string | null) {
-        this.db = db
-        this.teamCache = new Map()
-        this.eventNamesCache = new Map()
-        this.eventPropertiesCache = new Map()
-        this.instanceSiteUrl = instanceSiteUrl || 'unknown'
+    constructor(postgres: PostgresRouter, serverConfig: PluginsServerConfig) {
+        this.postgres = postgres
+
+        this.teamCache = new LRU({
+            max: 10_000,
+            maxAge: 2 * ONE_MINUTE,
+            updateAgeOnGet: false, // Make default behaviour explicit
+        })
+        this.tokenToTeamIdCache = new LRU({
+            max: 1_000_000, // Entries are small, keep a high limit to reduce risk of bad requests evicting good tokens
+            maxAge: 5 * ONE_MINUTE, // Expiration for negative lookups, positive lookups will expire via teamCache first
+            updateAgeOnGet: false, // Make default behaviour explicit
+        })
+        this.instanceSiteUrl = serverConfig.SITE_URL || 'unknown'
+    }
+
+    public async getTeamForEvent(event: PipelineEvent): Promise<Team | null> {
+        if (event.team_id) {
+            return this.fetchTeam(event.team_id)
+        } else if (event.token) {
+            return this.getTeamByToken(event.token)
+        } else {
+            return Promise.resolve(null)
+        }
     }
 
     public async fetchTeam(teamId: number): Promise<Team | null> {
-        const cachedTeam = getByAge(this.teamCache, teamId)
-        if (cachedTeam) {
+        const cachedTeam = this.getCachedTeam(teamId)
+        if (cachedTeam !== undefined) {
             return cachedTeam
         }
 
         const timeout = timeoutGuard(`Still running "fetchTeam". Timeout warning after 30 sec!`)
         try {
-            const team: Team | null = (await this.db.fetchTeam(teamId)) || null
-            this.teamCache.set(teamId, [team, Date.now()])
+            const team: Team | null = await fetchTeam(this.postgres, teamId)
+            this.teamCache.set(teamId, team)
             return team
         } finally {
             clearTimeout(timeout)
         }
     }
 
-    public async updateEventNamesAndProperties(teamId: number, event: string, properties: Properties): Promise<void> {
-        const team: Team | null = await this.fetchTeam(teamId)
+    public getCachedTeam(teamId: TeamId): Team | null | undefined {
+        return this.teamCache.get(teamId)
+    }
 
-        if (!team) {
-            return
+    public async getTeamByToken(token: string): Promise<Team | null> {
+        /**
+         * Validates and resolves the api token from an incoming event.
+         *
+         * Caching is added to reduce the load on Postgres, not to be resilient
+         * to failures. If PG is unavailable and the cache expired, this function
+         * will trow and the lookup must be retried later.
+         *
+         * Returns null if the token is invalid.
+         */
+
+        const cachedTeamId = this.tokenToTeamIdCache.get(token)
+
+        // LRU.get returns `undefined` if the key is not found, so `null`s will
+        // only be returned when caching a negative lookup (invalid token).
+        // A new token can potentially get caught here for up to 5 minutes
+        // if a bad request in the past used that token.
+        if (cachedTeamId === null) {
+            return null
         }
 
-        const timeout = timeoutGuard('Still running "updateEventNamesAndProperties". Timeout warning after 30 sec!', {
-            event: event,
-            ingested: team.ingested_event,
-        })
-
-        await this.cacheEventNamesAndProperties(team.id)
-
-        if (!this.eventNamesCache.get(team.id)?.has(event)) {
-            await this.db.postgresQuery(
-                `INSERT INTO posthog_eventdefinition (id, name, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, NULL, NULL, $3) ON CONFLICT DO NOTHING`,
-                [new UUIDT().toString(), event, team.id],
-                'insertEventDefinition'
-            )
-            this.eventNamesCache.get(team.id)?.add(event)
-        }
-
-        for (const [key, value] of Object.entries(properties)) {
-            if (!this.eventPropertiesCache.get(team.id)?.has(key)) {
-                await this.db.postgresQuery(
-                    `INSERT INTO posthog_propertydefinition (id, name, is_numerical, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, $3, NULL, NULL, $4) ON CONFLICT DO NOTHING`,
-                    [new UUIDT().toString(), key, typeof value === 'number', team.id],
-                    'insertPropertyDefinition'
-                )
-                this.eventPropertiesCache.get(team.id)?.add(key)
+        // Positive lookups hit both tokenToTeamIdCache and teamCache before returning without PG lookup.
+        // A revoked token will still be accepted until the teamCache entry expires (up to 2 minutes)
+        if (cachedTeamId) {
+            const cachedTeam = this.teamCache.get(cachedTeamId)
+            if (cachedTeam) {
+                return cachedTeam
             }
         }
 
+        // Query PG if token is not in cache. This will throw if PG is unavailable.
+        const timeout = timeoutGuard(`Still running "fetchTeamByToken". Timeout warning after 30 sec!`)
+        try {
+            const team = await fetchTeamByToken(this.postgres, token)
+            if (!team) {
+                // Cache `null` for unknown tokens to reduce PG load, cache TTL will lead to retries later.
+                this.tokenToTeamIdCache.set(token, null)
+                return null
+            }
+
+            this.tokenToTeamIdCache.set(token, team.id)
+            this.teamCache.set(team.id, team)
+            return team
+        } finally {
+            clearTimeout(timeout)
+        }
+    }
+
+    public async setTeamIngestedEvent(team: Team, properties: Properties) {
         if (team && !team.ingested_event) {
-            await this.db.postgresQuery(
+            await this.postgres.query(
+                PostgresUse.COMMON_WRITE,
                 `UPDATE posthog_team SET ingested_event = $1 WHERE id = $2`,
                 [true, team.id],
                 'setTeamIngestedEvent'
             )
 
-            // First event for the team captured
-            const organizationMembers = await this.db.postgresQuery(
+            // So long as team id is used as the partition key, this helps avoid
+            // double-firing of the first events, but it's not perfect (pod crashes
+            // or other rebalances, for example, can still cause double-firing). Exactly
+            // once is hard.
+            this.teamCache.set(team.id, { ...team, ingested_event: true })
+
+            // First event for the team captured - we fire this because comms and others rely on this event for onboarding flows in downstream systems (e.g. customer.io)
+            const organizationMembers = await this.postgres.query(
+                PostgresUse.COMMON_WRITE,
                 'SELECT distinct_id FROM posthog_user JOIN posthog_organizationmembership ON posthog_user.id = posthog_organizationmembership.user_id WHERE organization_id = $1',
                 [team.organization_id],
                 'posthog_organizationmembership'
             )
             const distinctIds: { distinct_id: string }[] = organizationMembers.rows
             for (const { distinct_id } of distinctIds) {
-                posthog.identify(distinct_id)
-                posthog.capture('first team event ingested', {
-                    team: team.uuid,
-                    sdk: properties.$lib,
-                    realm: properties.realm,
-                    host: properties.$host,
-                    $groups: {
+                posthog.capture({
+                    distinctId: distinct_id,
+                    event: 'first team event ingested',
+                    properties: {
+                        team: team.uuid,
+                        sdk: properties.$lib,
+                        realm: properties.realm,
+                        host: properties.$host,
+                    },
+                    groups: {
                         project: team.uuid,
                         organization: team.organization_id,
                         instance: this.instanceSiteUrl,
@@ -102,30 +149,96 @@ export class TeamManager {
                 })
             }
         }
-        clearTimeout(timeout)
     }
+}
 
-    public async cacheEventNamesAndProperties(teamId: number): Promise<void> {
-        let eventNamesCache = this.eventNamesCache.get(teamId)
-        if (!eventNamesCache) {
-            const eventNames = await this.db.postgresQuery(
-                'SELECT name FROM posthog_eventdefinition WHERE team_id = $1',
-                [teamId],
-                'fetchEventDefinitions'
-            )
-            eventNamesCache = new Set(eventNames.rows.map((r) => r.name))
-            this.eventNamesCache.set(teamId, eventNamesCache)
-        }
-
-        let eventPropertiesCache = this.eventPropertiesCache.get(teamId)
-        if (!eventPropertiesCache) {
-            const eventProperties = await this.db.postgresQuery(
-                'SELECT name FROM posthog_propertydefinition WHERE team_id = $1',
-                [teamId],
-                'fetchPropertyDefinitions'
-            )
-            eventPropertiesCache = new Set(eventProperties.rows.map((r) => r.name))
-            this.eventPropertiesCache.set(teamId, eventPropertiesCache)
-        }
+export async function fetchTeam(client: PostgresRouter, teamId: Team['id']): Promise<Team | null> {
+    const selectResult = await client.query<Team>(
+        PostgresUse.COMMON_READ,
+        `
+            SELECT
+                id,
+                project_id,
+                uuid,
+                organization_id,
+                name,
+                anonymize_ips,
+                api_token,
+                slack_incoming_webhook,
+                session_recording_opt_in,
+                person_processing_opt_out,
+                heatmaps_opt_in,
+                ingested_event,
+                person_display_name_properties,
+                test_account_filters,
+                cookieless_server_hash_mode,
+                timezone
+            FROM posthog_team
+            WHERE id = $1
+            `,
+        [teamId],
+        'fetchTeam'
+    )
+    if (selectResult.rows.length === 0) {
+        return null
     }
+    // pg returns int8 as a string, since it can be larger than JS's max safe integer,
+    // but this is not a problem for project_id, which is a long long way from that limit.
+    selectResult.rows[0].project_id = Number(selectResult.rows[0].project_id) as ProjectId
+    return selectResult.rows[0]
+}
+
+export async function fetchTeamByToken(client: PostgresRouter, token: string): Promise<Team | null> {
+    const selectResult = await client.query<Team>(
+        PostgresUse.COMMON_READ,
+        `
+            SELECT
+                id,
+                project_id,
+                uuid,
+                organization_id,
+                name,
+                anonymize_ips,
+                api_token,
+                slack_incoming_webhook,
+                session_recording_opt_in,
+                person_processing_opt_out,
+                heatmaps_opt_in,
+                ingested_event,
+                person_display_name_properties,
+                test_account_filters,
+                cookieless_server_hash_mode,
+                timezone
+            FROM posthog_team
+            WHERE api_token = $1
+            LIMIT 1
+                `,
+        [token],
+        'fetchTeamByToken'
+    )
+    if (selectResult.rows.length === 0) {
+        return null
+    }
+    // pg returns int8 as a string, since it can be larger than JS's max safe integer,
+    // but this is not a problem for project_id, which is a long long way from that limit.
+    selectResult.rows[0].project_id = Number(selectResult.rows[0].project_id) as ProjectId
+    return selectResult.rows[0]
+}
+
+export async function fetchTeamTokensWithRecordings(client: PostgresRouter): Promise<Record<string, TeamIDWithConfig>> {
+    const selectResult = await client.query<{ capture_console_log_opt_in: boolean } & Pick<Team, 'id' | 'api_token'>>(
+        PostgresUse.COMMON_READ,
+        `
+            SELECT id, api_token, capture_console_log_opt_in
+            FROM posthog_team
+            WHERE session_recording_opt_in = true
+        `,
+        [],
+        'fetchTeamTokensWithRecordings'
+    )
+
+    return selectResult.rows.reduce((acc, row) => {
+        acc[row.api_token] = { teamId: row.id, consoleLogIngestionEnabled: row.capture_console_log_opt_in }
+        return acc
+    }, {} as Record<string, TeamIDWithConfig>)
 }

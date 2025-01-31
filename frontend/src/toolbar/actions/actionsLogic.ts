@@ -1,34 +1,29 @@
-import { kea } from 'kea'
-import { toolbarLogic } from '~/toolbar/toolbarLogic'
-import { actionsLogicType } from './actionsLogicType'
-import { ActionType } from '~/types'
 import Fuse from 'fuse.js'
-import { toolbarFetch } from '~/toolbar/utils'
+import { actions, kea, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { permanentlyMount } from 'lib/utils/kea-logic-builders'
 
-export const actionsLogic = kea<actionsLogicType>({
-    path: ['toolbar', 'actions', 'actionsLogic'],
-    actions: {
+import { toolbarConfigLogic, toolbarFetch } from '~/toolbar/toolbarConfigLogic'
+import { ActionType } from '~/types'
+
+import type { actionsLogicType } from './actionsLogicType'
+
+export const actionsLogic = kea<actionsLogicType>([
+    path(['toolbar', 'actions', 'actionsLogic']),
+    actions({
         setSearchTerm: (searchTerm: string) => ({ searchTerm }),
-    },
-    reducers: {
-        searchTerm: [
-            '',
-            {
-                setSearchTerm: (_, { searchTerm }) => searchTerm,
-            },
-        ],
-    },
-    loaders: ({ values }) => ({
+    }),
+    loaders(({ values }) => ({
         allActions: [
             [] as ActionType[],
             {
-                // eslint-disable-next-line
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
                 getActions: async (_ = null, breakpoint: () => void) => {
                     const response = await toolbarFetch('/api/projects/@current/actions/')
                     const results = await response.json()
 
                     if (response.status === 403) {
-                        toolbarLogic.actions.authenticate()
+                        toolbarConfigLogic.actions.authenticate()
                         return []
                     }
 
@@ -48,9 +43,16 @@ export const actionsLogic = kea<actionsLogicType>({
                 },
             },
         ],
+    })),
+    reducers({
+        searchTerm: [
+            '',
+            {
+                setSearchTerm: (_, { searchTerm }) => searchTerm,
+            },
+        ],
     }),
-
-    selectors: {
+    selectors({
         sortedActions: [
             (s) => [s.allActions, s.searchTerm],
             (allActions, searchTerm) => {
@@ -62,11 +64,10 @@ export const actionsLogic = kea<actionsLogicType>({
                           .search(searchTerm)
                           .map(({ item }) => item)
                     : allActions
-                return [...filteredActions].sort((a, b) =>
-                    (a.name ?? 'Untitled').localeCompare(b.name ?? 'Untitled')
-                ) as ActionType[]
+                return [...filteredActions].sort((a, b) => (a.name ?? 'Untitled').localeCompare(b.name ?? 'Untitled'))
             },
         ],
         actionCount: [(s) => [s.allActions], (allActions) => allActions.length],
-    },
-})
+    }),
+    permanentlyMount(),
+])

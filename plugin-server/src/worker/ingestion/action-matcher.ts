@@ -1,29 +1,30 @@
-import { PluginEvent } from '@posthog/plugin-scaffold'
-import { Properties } from '@posthog/plugin-scaffold/src/types'
+import { Properties } from '@posthog/plugin-scaffold'
 import { captureException } from '@sentry/node'
 import escapeStringRegexp from 'escape-string-regexp'
 import equal from 'fast-deep-equal'
-import { StatsD } from 'hot-shots'
+import { Summary } from 'prom-client'
 import RE2 from 're2'
 
 import {
     Action,
     ActionStep,
-    ActionStepUrlMatching,
     CohortPropertyFilter,
     Element,
     ElementPropertyFilter,
     EventPropertyFilter,
-    Person,
     PersonPropertyFilter,
+    PostIngestionEvent,
     PropertyFilter,
     PropertyFilterWithOperator,
     PropertyOperator,
+    StringMatching,
 } from '../../types'
-import { DB } from '../../utils/db/db'
-import { extractElements } from '../../utils/db/utils'
-import { stringify, stringToBoolean } from '../../utils/utils'
+import { PostgresRouter, PostgresUse } from '../../utils/db/postgres'
+import { stringToBoolean } from '../../utils/env-utils'
+import { mutatePostIngestionEventWithElementsList } from '../../utils/event'
+import { stringify } from '../../utils/utils'
 import { ActionManager } from './action-manager'
+import { TeamManager } from './team-manager'
 
 /** These operators can only be matched if the provided filter's value has the right type. */
 const propertyOperatorToRequiredValueType: Partial<Record<PropertyOperator, string[]>> = {
@@ -43,14 +44,31 @@ const emptyMatchingOperator: Partial<Record<PropertyOperator, boolean>> = {
     [PropertyOperator.NotRegex]: true,
 }
 
+const actionMatchMsSummary = new Summary({
+    name: 'action_match_ms',
+    help: 'Time taken to match actions',
+    percentiles: [0.5, 0.9, 0.95, 0.99],
+})
+
 /** Return whether two values compare to each other according to the specified operator.
  * This simulates the behavior of ClickHouse (or other DBMSs) which like to cast values in SELECTs to the column's type.
  */
 export function castingCompare(
-    a: any, // eslint-disable-line @typescript-eslint/explicit-module-boundary-types
-    b: any, // eslint-disable-line @typescript-eslint/explicit-module-boundary-types
+    a: any,
+    b: any,
     operator: PropertyOperator.Exact | PropertyOperator.IsNot | PropertyOperator.LessThan | PropertyOperator.GreaterThan
 ): boolean {
+    // Do null transformation first
+    // Clickhouse treats the string "null" as null, while here we treat them as different values
+    // Thus, this check special cases the string "null" to be equal to the null value
+    // See more: https://github.com/PostHog/posthog/issues/12893
+    if (a === null) {
+        a = 'null'
+    }
+    if (b === null) {
+        b = 'null'
+    }
+
     // Check basic case first
     switch (operator) {
         case PropertyOperator.Exact:
@@ -95,27 +113,42 @@ export function castingCompare(
     return false
 }
 
-export class ActionMatcher {
-    private db: DB
-    private actionManager: ActionManager
-    private statsd: StatsD | undefined
+export function matchString(actual: string, expected: string, matching: StringMatching): boolean {
+    switch (matching) {
+        case StringMatching.Regex:
+            // Using RE2 here because that's what ClickHouse uses for regex matching anyway
+            // It's also safer for user-provided patterns because of a few explicit limitations
+            try {
+                return new RE2(expected).test(actual)
+            } catch {
+                return false
+            }
+        case StringMatching.Exact:
+            return expected === actual
+        case StringMatching.Contains:
+            // Simulating SQL LIKE behavior (_ = any single character, % = any zero or more characters)
+            const adjustedRegExpString = escapeStringRegexp(expected).replace(/_/g, '.').replace(/%/g, '.*')
+            return new RegExp(adjustedRegExpString).test(actual)
+    }
+}
 
-    constructor(db: DB, actionManager: ActionManager, statsd?: StatsD) {
-        this.db = db
-        this.actionManager = actionManager
-        this.statsd = statsd
+export class ActionMatcher {
+    constructor(
+        private postgres: PostgresRouter,
+        private actionManager: ActionManager,
+        private teamManager: TeamManager
+    ) {}
+
+    public hasWebhooks(teamId: number): boolean {
+        return Object.keys(this.actionManager.getTeamActions(teamId)).length > 0
     }
 
     /** Get all actions matched to the event. */
-    public async match(event: PluginEvent, person?: Person, elements?: Element[]): Promise<Action[]> {
+    public async match(event: PostIngestionEvent): Promise<Action[]> {
         const matchingStart = new Date()
-        const teamActions: Action[] = Object.values(this.actionManager.getTeamActions(event.team_id))
-        if (!elements) {
-            const rawElements: Record<string, any>[] | undefined = event.properties?.['$elements']
-            elements = rawElements ? extractElements(rawElements) : []
-        }
+        const teamActions: Action[] = Object.values(this.actionManager.getTeamActions(event.teamId))
         const teamActionsMatching: boolean[] = await Promise.all(
-            teamActions.map((action) => this.checkAction(event, elements, person, action))
+            teamActions.map((action) => this.checkAction(event, action))
         )
         const matches: Action[] = []
         for (let i = 0; i < teamActionsMatching.length; i++) {
@@ -123,9 +156,12 @@ export class ActionMatcher {
                 matches.push(teamActions[i])
             }
         }
-        this.statsd?.timing('action_matching_for_event', matchingStart)
-        this.statsd?.increment('action_matches_found', matches.length)
+        actionMatchMsSummary.observe(new Date().getTime() - matchingStart.getTime())
         return matches
+    }
+
+    public getActionById(teamId: number, actionId: number): Action | undefined {
+        return this.actionManager.getTeamActions(teamId)[actionId]
     }
 
     /**
@@ -134,25 +170,29 @@ export class ActionMatcher {
      * Return whether the event is a match for the action.
      * The event is considered a match if any of the action's steps (match groups) is a match.
      */
-    public async checkAction(
-        event: PluginEvent,
-        elements: Element[] | undefined,
-        person: Person | undefined,
-        action: Action
-    ): Promise<boolean> {
+    public async checkAction(event: PostIngestionEvent, action: Action): Promise<boolean> {
         for (const step of action.steps) {
             try {
-                if (await this.checkStep(event, elements, person, step)) {
+                if (await this.checkStep(event, step)) {
                     return true
                 }
             } catch (error) {
                 captureException(error, {
                     tags: { team_id: action.team_id },
-                    extra: { event, elements, person, action, step },
+                    extra: { event, action, step },
                 })
             }
         }
         return false
+    }
+
+    /**
+     * Helper method to build the elementsList if not already present and return it.
+     */
+    private getElementsList(event: PostIngestionEvent): Element[] {
+        mutatePostIngestionEventWithElementsList(event)
+
+        return event.elementsList ?? []
     }
 
     /**
@@ -161,20 +201,13 @@ export class ActionMatcher {
      * Return whether the event is a match for the step (match group).
      * The event is considered a match if no subcheck fails. Many subchecks are usually irrelevant and skipped.
      */
-    private async checkStep(
-        event: PluginEvent,
-        elements: Element[] | undefined,
-        person: Person | undefined,
-        step: ActionStep
-    ): Promise<boolean> {
-        if (!elements) {
-            elements = []
-        }
+    private async checkStep(event: PostIngestionEvent, step: ActionStep): Promise<boolean> {
         return (
-            this.checkStepElement(elements, step) &&
             this.checkStepUrl(event, step) &&
             this.checkStepEvent(event, step) &&
-            (await this.checkStepFilters(event, elements, person, step))
+            // The below checks are less performant may parse the elements chain or do a database query hence moved to the end
+            this.checkStepElement(event, step) &&
+            (await this.checkStepFilters(event, step))
         )
     }
 
@@ -184,34 +217,14 @@ export class ActionMatcher {
      * Return whether the event is a match for the step's "URL" constraint.
      * Step properties: `url_matching`, `url`.
      */
-    private checkStepUrl(event: PluginEvent, step: ActionStep): boolean {
+    private checkStepUrl(event: PostIngestionEvent, step: ActionStep): boolean {
         // CHECK CONDITIONS, OTHERWISE SKIPPED
         if (step.url) {
             const eventUrl = event.properties?.$current_url
             if (!eventUrl || typeof eventUrl !== 'string') {
                 return false // URL IS UNKNOWN
             }
-            let doesUrlMatch: boolean
-            switch (step.url_matching) {
-                case ActionStepUrlMatching.Regex:
-                    // Using RE2 here because that's what ClickHouse uses for regex matching anyway
-                    // It's also safer for user-provided patterns because of a few explicit limitations
-                    try {
-                        doesUrlMatch = new RE2(step.url).test(eventUrl)
-                    } catch {
-                        doesUrlMatch = false
-                    }
-                    break
-                case ActionStepUrlMatching.Exact:
-                    doesUrlMatch = step.url === eventUrl
-                    break
-                case ActionStepUrlMatching.Contains:
-                default:
-                    // Simulating SQL LIKE behavior (_ = any single character, % = any zero or more characters)
-                    const adjustedRegExpString = escapeStringRegexp(step.url).replace(/_/g, '.').replace(/%/g, '.*')
-                    doesUrlMatch = new RegExp(adjustedRegExpString).test(eventUrl)
-            }
-            if (!doesUrlMatch) {
+            if (!matchString(eventUrl, step.url, step.url_matching || StringMatching.Contains)) {
                 return false // URL IS A MISMATCH
             }
         }
@@ -225,18 +238,25 @@ export class ActionMatcher {
      * the step's "Link href equals", "Text equals" and "HTML selector matches" constraints.
      * Step properties: `tag_name`, `text`, `href`, `selector`.
      */
-    private checkStepElement(elements: Element[], step: ActionStep): boolean {
+    private checkStepElement(event: PostIngestionEvent, step: ActionStep): boolean {
         // CHECK CONDITIONS, OTHERWISE SKIPPED
         if (step.href || step.tag_name || step.text) {
+            const elements = this.getElementsList(event)
             if (
                 !elements.some((element) => {
-                    if (step.href && element.href !== step.href) {
+                    if (
+                        step.href &&
+                        !matchString(element.href || '', step.href, step.href_matching || StringMatching.Exact)
+                    ) {
                         return false // ELEMENT HREF IS A MISMATCH
                     }
                     if (step.tag_name && element.tag_name !== step.tag_name) {
                         return false // ELEMENT TAG NAME IS A MISMATCH
                     }
-                    if (step.text && element.text !== step.text) {
+                    if (
+                        step.text &&
+                        !matchString(element.text || '', step.text, step.text_matching || StringMatching.Exact)
+                    ) {
                         return false // ELEMENT TEXT IS A MISMATCH
                     }
                     return true
@@ -246,7 +266,7 @@ export class ActionMatcher {
                 return false
             }
         }
-        if (step.selector && !this.checkElementsAgainstSelector(elements, step.selector)) {
+        if (step.selector && !this.checkElementsAgainstSelector(event, step.selector)) {
             return false // SELECTOR IS A MISMATCH
         }
         return true
@@ -258,7 +278,7 @@ export class ActionMatcher {
      * Return whether the event is a match for the step's event name constraint.
      * Step property: `event`.
      */
-    private checkStepEvent(event: PluginEvent, step: ActionStep): boolean {
+    private checkStepEvent(event: PostIngestionEvent, step: ActionStep): boolean {
         // CHECK CONDITIONS, OTHERWISE SKIPPED
         if (step.event && event.event !== step.event) {
             return false // EVENT NAME IS A MISMATCH
@@ -272,17 +292,12 @@ export class ActionMatcher {
      * Return whether the event is a match for the step's fiter constraints.
      * Step property: `properties`.
      */
-    private async checkStepFilters(
-        event: PluginEvent,
-        elements: Element[],
-        person: Person | undefined,
-        step: ActionStep
-    ): Promise<boolean> {
+    private async checkStepFilters(event: PostIngestionEvent, step: ActionStep): Promise<boolean> {
         // CHECK CONDITIONS, OTHERWISE SKIPPED, OTHERWISE SKIPPED
         if (step.properties && step.properties.length) {
             // EVERY FILTER MUST BE A MATCH
             for (const filter of step.properties) {
-                if (!(await this.checkEventAgainstFilter(event, elements, person, filter))) {
+                if (!(await this.checkEventAgainstFilterAsync(event, filter))) {
                     return false
                 }
             }
@@ -293,21 +308,32 @@ export class ActionMatcher {
     /**
      * Sublevel 3 of action matching.
      */
-    private async checkEventAgainstFilter(
-        event: PluginEvent,
-        elements: Element[],
-        person: Person | undefined,
-        filter: PropertyFilter
-    ): Promise<boolean> {
+    private checkEventAgainstFilterSync(event: PostIngestionEvent, filter: PropertyFilter): boolean {
         switch (filter.type) {
             case 'event':
                 return this.checkEventAgainstEventFilter(event, filter)
             case 'person':
-                return this.checkEventAgainstPersonFilter(person, filter)
+                return this.checkEventAgainstPersonFilter(event, filter)
             case 'element':
-                return this.checkEventAgainstElementFilter(elements, filter)
+                return this.checkEventAgainstElementFilter(event, filter)
+            default:
+                return false
+        }
+    }
+
+    /**
+     * Sublevel 3 of action matching.
+     */
+    private async checkEventAgainstFilterAsync(event: PostIngestionEvent, filter: PropertyFilter): Promise<boolean> {
+        const match = this.checkEventAgainstFilterSync(event, filter)
+
+        if (match) {
+            return match
+        }
+
+        switch (filter.type) {
             case 'cohort':
-                return await this.checkEventAgainstCohortFilter(person, filter)
+                return await this.checkEventAgainstCohortFilter(event, filter)
             default:
                 return false
         }
@@ -316,31 +342,31 @@ export class ActionMatcher {
     /**
      * Sublevel 4 of action matching.
      */
-    private checkEventAgainstEventFilter(event: PluginEvent, filter: EventPropertyFilter): boolean {
+    private checkEventAgainstEventFilter(event: PostIngestionEvent, filter: EventPropertyFilter): boolean {
         return this.checkPropertiesAgainstFilter(event.properties, filter)
     }
 
     /**
      * Sublevel 4 of action matching.
      */
-    private checkEventAgainstPersonFilter(person: Person | undefined, filter: PersonPropertyFilter): boolean {
-        if (!person?.properties) {
+    private checkEventAgainstPersonFilter(event: PostIngestionEvent, filter: PersonPropertyFilter): boolean {
+        if (!event.person_properties) {
             return !!(filter.operator && emptyMatchingOperator[filter.operator]) // NO PERSON OR PROPERTIES TO MATCH AGAINST FILTER
         }
-        return this.checkPropertiesAgainstFilter(person.properties, filter)
+        return this.checkPropertiesAgainstFilter(event.person_properties, filter)
     }
 
     /**
      * Sublevel 4 of action matching.
      */
-    private checkEventAgainstElementFilter(elements: Element[], filter: ElementPropertyFilter): boolean {
+    private checkEventAgainstElementFilter(event: PostIngestionEvent, filter: ElementPropertyFilter): boolean {
         if (filter.key === 'selector') {
             const okValues = Array.isArray(filter.value) ? filter.value : [filter.value]
             return okValues.some((okValue) =>
-                okValue ? this.checkElementsAgainstSelector(elements, okValue.toString()) : false
+                okValue ? this.checkElementsAgainstSelector(event, okValue.toString()) : false
             )
         } else {
-            return elements.some((element) => this.checkPropertiesAgainstFilter(element, filter))
+            return this.getElementsList(event).some((element) => this.checkPropertiesAgainstFilter(element, filter))
         }
     }
 
@@ -348,7 +374,7 @@ export class ActionMatcher {
      * Sublevel 4 of action matching.
      */
     private async checkEventAgainstCohortFilter(
-        person: Person | undefined,
+        event: PostIngestionEvent,
         filter: CohortPropertyFilter
     ): Promise<boolean> {
         let cohortId = filter.value
@@ -356,7 +382,7 @@ export class ActionMatcher {
             // The "All users" cohort matches anyone
             return true
         }
-        if (!person) {
+        if (!event.person_id) {
             return false // NO PERSON TO MATCH AGAINST COHORT
         }
         if (typeof cohortId !== 'number') {
@@ -365,7 +391,25 @@ export class ActionMatcher {
         if (isNaN(cohortId)) {
             throw new Error(`Can't match against invalid cohort ID value "${filter.value}!"`)
         }
-        return await this.db.doesPersonBelongToCohort(Number(filter.value), person, person.team_id)
+        return await this.doesPersonBelongToCohort(Number(filter.value), event.person_id, event.teamId)
+    }
+
+    public async doesPersonBelongToCohort(cohortId: number, personUuid: string, teamId: number): Promise<boolean> {
+        const psqlResult = await this.postgres.query(
+            PostgresUse.COMMON_READ,
+            `
+        SELECT count(1) AS count
+        FROM posthog_cohortpeople
+        JOIN posthog_cohort ON (posthog_cohort.id = posthog_cohortpeople.cohort_id)
+        JOIN (SELECT * FROM posthog_person where team_id = $3) AS posthog_person_in_team ON (posthog_cohortpeople.person_id = posthog_person_in_team.id)
+        WHERE cohort_id=$1
+          AND posthog_person_in_team.uuid=$2
+          AND posthog_cohortpeople.version IS NOT DISTINCT FROM posthog_cohort.version
+        `,
+            [cohortId, personUuid, teamId],
+            'doesPersonBelongToCohort'
+        )
+        return psqlResult.rows[0].count > 0
     }
 
     /**
@@ -430,7 +474,8 @@ export class ActionMatcher {
     /**
      * Sublevel 3 or 5 of action matching.
      */
-    public checkElementsAgainstSelector(elements: Element[], selector: string, escapeSlashes = true): boolean {
+    public checkElementsAgainstSelector(event: PostIngestionEvent, selector: string, escapeSlashes = true): boolean {
+        const elements = this.getElementsList(event)
         const parts: SelectorPart[] = []
         // Sometimes people manually add *, just remove them as they don't do anything
         selector = selector

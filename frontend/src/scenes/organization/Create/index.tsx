@@ -1,7 +1,7 @@
-import React from 'react'
-import { CreateOrganizationModal } from '../CreateOrganizationModal'
-import { SceneExport } from 'scenes/sceneTypes'
 import { organizationLogic } from 'scenes/organizationLogic'
+import { SceneExport } from 'scenes/sceneTypes'
+
+import { CreateOrganizationModal } from '../CreateOrganizationModal'
 
 export const scene: SceneExport = {
     component: OrganizationCreate,
@@ -9,5 +9,5 @@ export const scene: SceneExport = {
 }
 
 export function OrganizationCreate(): JSX.Element {
-    return <CreateOrganizationModal isVisible mask={false} />
+    return <CreateOrganizationModal isVisible inline />
 }

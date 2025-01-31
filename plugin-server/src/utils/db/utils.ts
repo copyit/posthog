@@ -1,57 +1,34 @@
 import { Properties } from '@posthog/plugin-scaffold'
 import * as Sentry from '@sentry/node'
-import crypto from 'crypto'
-import { ProducerRecord } from 'kafkajs'
-import { DateTime } from 'luxon'
+import { Counter } from 'prom-client'
+
+import { TopicMessage } from '~/src/kafka/producer'
 
 import { defaultConfig } from '../../config/config'
 import { KAFKA_PERSON } from '../../config/kafka-topics'
-import { BasePerson, Element, Person, RawPerson, TimestampFormat } from '../../types'
-import { castTimestampOrNow } from '../../utils/utils'
+import {
+    BasePerson,
+    ClickHousePerson,
+    InternalPerson,
+    PluginLogEntryType,
+    PluginLogLevel,
+    RawPerson,
+    TimestampFormat,
+} from '../../types'
+import { status } from '../../utils/status'
+import { areMapsEqual, castTimestampOrNow } from '../../utils/utils'
 
-export function unparsePersonPartial(person: Partial<Person>): Partial<RawPerson> {
-    return { ...(person as BasePerson), ...(person.created_at ? { created_at: person.created_at.toISO() } : {}) }
+export function unparsePersonPartial(person: Partial<InternalPerson>): Partial<RawPerson> {
+    return {
+        ...(person as BasePerson),
+        ...(person.created_at ? { created_at: person.created_at.toISO() ?? undefined } : {}),
+    }
 }
 
 export function escapeQuotes(input: string): string {
     return input.replace(/"/g, '\\"')
 }
 
-export function elementsToString(elements: Element[]): string {
-    const ret = elements.map((element) => {
-        let el_string = ''
-        if (element.tag_name) {
-            el_string += element.tag_name
-        }
-        if (element.attr_class) {
-            element.attr_class.sort()
-            for (const single_class of element.attr_class) {
-                el_string += `.${single_class.replace(/"/g, '')}`
-            }
-        }
-        let attributes: Record<string, any> = {
-            ...(element.text ? { text: element.text } : {}),
-            'nth-child': element.nth_child ?? 0,
-            'nth-of-type': element.nth_of_type ?? 0,
-            ...(element.href ? { href: element.href } : {}),
-            ...(element.attr_id ? { attr_id: element.attr_id } : {}),
-            ...element.attributes,
-        }
-        attributes = Object.fromEntries(
-            Object.entries(attributes)
-                .sort(([a], [b]) => a.localeCompare(b))
-                .map(([key, value]) => [escapeQuotes(key.toString()), escapeQuotes(value.toString())])
-        )
-        el_string += ':'
-        el_string += Object.entries(attributes)
-            .map(([key, value]) => `${key}="${value}"`)
-            .join('')
-        return el_string
-    })
-    return ret.join(';')
-}
-
-// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
 export function sanitizeEventName(eventName: any): string {
     if (typeof eventName !== 'string') {
         try {
@@ -63,193 +40,162 @@ export function sanitizeEventName(eventName: any): string {
     return eventName.substr(0, 200)
 }
 
-/** Escape UTF-8 characters into `\u1234`. */
-function jsonEscapeUtf8(s: string): string {
-    return s.replace(/[^\x20-\x7F]/g, (x) => '\\u' + ('000' + x.codePointAt(0)?.toString(16)).slice(-4))
-}
-
-/** Produce output compatible with that of Python's `json.dumps`. */
-function jsonDumps(obj: any): string {
-    if (typeof obj === 'object' && obj !== null) {
-        if (Array.isArray(obj)) {
-            return `[${obj.map(jsonDumps).join(', ')}]` // space after comma
-        } else {
-            return `{${Object.keys(obj) // no space after '{' or before '}'
-                .sort() // must sort the keys of the object!
-                .map((k) => `${jsonDumps(k)}: ${jsonDumps(obj[k])}`) // space after ':'
-                .join(', ')}}` // space after ','
-        }
-    } else if (typeof obj === 'string') {
-        return jsonEscapeUtf8(JSON.stringify(obj))
-    } else {
-        return JSON.stringify(obj)
-    }
-}
-
-export function hashElements(elements: Element[]): string {
-    const elementsList = elements.map((element) => ({
-        attributes: element.attributes ?? null,
-        text: element.text ?? null,
-        tag_name: element.tag_name ?? null,
-        href: element.href ?? null,
-        attr_id: element.attr_id ?? null,
-        attr_class: element.attr_class ?? null,
-        nth_child: element.nth_child ?? null,
-        nth_of_type: element.nth_of_type ?? null,
-        order: element.order ?? null,
-    }))
-
-    const serializedString = jsonDumps(elementsList)
-
-    return crypto.createHash('md5').update(serializedString).digest('hex')
-}
-
-export function chainToElements(chain: string): Element[] {
-    const elements: Element[] = []
-
-    // Below splits all elements by ;, while ignoring escaped quotes and semicolons within quotes
-    const splitChainRegex = /(?:[^\s;"]|"(?:\\.|[^"])*")+/g
-
-    // Below splits the tag/classes from attributes
-    // Needs a regex because classes can have : too
-    const splitClassAttributes = /(.*?)($|:([a-zA-Z\-_0-9]*=.*))/g
-    const parseAttributesRegex = /((.*?)="(.*?[^\\])")/gm
-
-    Array.from(chain.matchAll(splitChainRegex))
-        .map((r) => r[0])
-        .forEach((elString, index) => {
-            const elStringSplit = Array.from(elString.matchAll(splitClassAttributes))[0]
-            const attributes =
-                elStringSplit.length > 3
-                    ? Array.from(elStringSplit[3].matchAll(parseAttributesRegex)).map((a) => [a[2], a[3]])
-                    : []
-
-            const element: Element = {
-                attributes: {},
-                order: index,
-            }
-
-            if (elStringSplit[1]) {
-                const tagAndClass = elStringSplit[1].split('.')
-                element.tag_name = tagAndClass[0]
-                if (tagAndClass.length > 1) {
-                    const [_, ...rest] = tagAndClass
-                    element.attr_class = rest.filter((t) => t)
-                }
-            }
-
-            for (const [key, value] of attributes) {
-                if (key == 'href') {
-                    element.href = value
-                } else if (key == 'nth-child') {
-                    element.nth_child = parseInt(value)
-                } else if (key == 'nth-of-type') {
-                    element.nth_of_type = parseInt(value)
-                } else if (key == 'text') {
-                    element.text = value
-                } else if (key == 'attr_id') {
-                    element.attr_id = value
-                } else if (key) {
-                    if (!element.attributes) {
-                        element.attributes = {}
-                    }
-                    element.attributes[key] = value
-                }
-            }
-            elements.push(element)
-        })
-
-    return elements
-}
-
-export function extractElements(elements: Record<string, any>[]): Element[] {
-    return elements.map((el) => ({
-        text: el['$el_text']?.slice(0, 400),
-        tag_name: el['tag_name'],
-        href: el['attr__href']?.slice(0, 2048),
-        attr_class: el['attr__class']?.split(' '),
-        attr_id: el['attr__id'],
-        nth_child: el['nth_child'],
-        nth_of_type: el['nth_of_type'],
-        attributes: Object.fromEntries(Object.entries(el).filter(([key]) => key.startsWith('attr__'))),
-    }))
-}
-
 export function timeoutGuard(
     message: string,
-    context?: Record<string, any>,
-    timeout = defaultConfig.TASK_TIMEOUT * 1000
+    context?: Record<string, any> | (() => Record<string, any>),
+    timeout = defaultConfig.TASK_TIMEOUT * 1000,
+    sendToSentry = true
 ): NodeJS.Timeout {
     return setTimeout(() => {
-        console.log(`⌛⌛⌛ ${message}`, context)
-        Sentry.captureMessage(message, context ? { extra: context } : undefined)
+        const ctx = typeof context === 'function' ? context() : context
+        status.warn('⌛', message, ctx)
+        if (sendToSentry) {
+            Sentry.captureMessage(message, ctx ? { extra: ctx } : undefined)
+        }
     }, timeout)
 }
+// When changing this set, make sure you also make the same changes in:
+// - taxonomy.tsx (CAMPAIGN_PROPERTIES)
+// - posthog-js event-utils.ts (CAMPAIGN_PARAMS)
+export const campaignParams = new Set([
+    'utm_source',
+    'utm_medium',
+    'utm_campaign',
+    'utm_content',
+    'utm_name',
+    'utm_term',
+    'gclid', // google ads
+    'gad_source', // google ads
+    'gclsrc', // google ads 360
+    'dclid', // google display ads
+    'gbraid', // google ads, web to app
+    'wbraid', // google ads, app to web
+    'fbclid', // facebook
+    'msclkid', // microsoft
+    'twclid', // twitter
+    'li_fat_id', // linkedin
+    'mc_cid', // mailchimp campaign id
+    'igshid', // instagram
+    'ttclid', // tiktok
+    'rdt_cid', // reddit
+    'irclid', // impact
+    '_kx', // klaviyo
+])
 
-const campaignParams = new Set(['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'gclid'])
-const initialParams = new Set([
+export const initialCampaignParams = new Set(Array.from(campaignParams, (key) => `$initial_${key.replace('$', '')}`))
+
+// When changing this set, make sure you also make the same changes in:
+// - taxonomy.tsx (PERSON_PROPERTIES_ADAPTED_FROM_EVENT)
+export const eventToPersonProperties = new Set([
+    // mobile params
+    '$app_build',
+    '$app_name',
+    '$app_namespace',
+    '$app_version',
+    // web params
     '$browser',
     '$browser_version',
     '$device_type',
     '$current_url',
+    '$pathname',
     '$os',
+    '$os_name', // $os_name is a special case, it's treated as an alias of $os!
+    '$os_version',
     '$referring_domain',
     '$referrer',
+
+    ...campaignParams,
 ])
-const combinedParams = new Set([...campaignParams, ...initialParams])
+export const initialEventToPersonProperties = new Set(
+    Array.from(eventToPersonProperties, (key) => `$initial_${key.replace('$', '')}`)
+)
 
 /** If we get new UTM params, make sure we set those  **/
 export function personInitialAndUTMProperties(properties: Properties): Properties {
     const propertiesCopy = { ...properties }
-    const maybeSet = Object.entries(properties).filter(([key, value]) => campaignParams.has(key))
 
-    const maybeSetInitial = Object.entries(properties)
-        .filter(([key, value]) => combinedParams.has(key))
-        .map(([key, value]) => [`$initial_${key.replace('$', '')}`, value])
-    if (Object.keys(maybeSet).length > 0) {
-        propertiesCopy.$set = { ...(properties.$set || {}), ...Object.fromEntries(maybeSet) }
+    const propertiesForPerson: [string, any][] = Object.entries(properties).filter(([key]) =>
+        eventToPersonProperties.has(key)
+    )
+
+    // all potential params are checked for $initial_ values and added to $set_once
+    const maybeSetOnce: [string, any][] = propertiesForPerson.map(([key, value]) => [
+        `$initial_${key.replace('$', '')}`,
+        value,
+    ])
+
+    // all found are also then added to $set
+    const maybeSet: [string, any][] = propertiesForPerson
+
+    if (maybeSet.length > 0) {
+        propertiesCopy.$set = { ...Object.fromEntries(maybeSet), ...(properties.$set || {}) }
     }
-    if (Object.keys(maybeSetInitial).length > 0) {
-        propertiesCopy.$set_once = { ...(properties.$set_once || {}), ...Object.fromEntries(maybeSetInitial) }
+    if (maybeSetOnce.length > 0) {
+        propertiesCopy.$set_once = { ...Object.fromEntries(maybeSetOnce), ...(properties.$set_once || {}) }
     }
+
+    if (propertiesCopy.$os_name) {
+        // For the purposes of $initial properties, $os_name is treated as a fallback alias of $os, starting August 2024
+        // It's as special case due to _some_ SDKs using $os_name: https://github.com/PostHog/posthog-js-lite/issues/244
+        propertiesCopy.$os ??= propertiesCopy.$os_name
+        propertiesCopy.$set.$os ??= propertiesCopy.$os_name
+        propertiesCopy.$set_once.$initial_os ??= propertiesCopy.$os_name
+        // Make sure $os_name is not used in $set/$set_once, as that hasn't been a thing before
+        delete propertiesCopy.$set.$os_name
+        delete propertiesCopy.$set_once.$initial_os_name
+    }
+
     return propertiesCopy
 }
 
-/** Returns string in format: ($1, $2, $3, $4, $5, $6, $7, $8, ..., $N) */
-export function generatePostgresValuesString(numberOfColumns: number, rowNumber: number): string {
-    return (
-        '(' +
-        Array.from(Array(numberOfColumns).keys())
-            .map((x) => `$${x + 1 + rowNumber * numberOfColumns}`)
-            .join(', ') +
-        ')'
+export function hasDifferenceWithProposedNewNormalisationMode(properties: Properties): boolean {
+    // this functions checks if there would be a difference in the properties if we strip the initial campaign params
+    // when any $set_once initial eventToPersonProperties are present. This will often return true for events from
+    // posthog-js, but it is unknown if this will be the case for other SDKs.
+    if (
+        !properties.$set_once ||
+        !Object.keys(properties.$set_once).some((key) => initialEventToPersonProperties.has(key))
+    ) {
+        return false
+    }
+
+    const propertiesForPerson: [string, any][] = Object.entries(properties).filter(([key]) =>
+        eventToPersonProperties.has(key)
     )
+
+    const maybeSetOnce: [string, any][] = propertiesForPerson.map(([key, value]) => [
+        `$initial_${key.replace('$', '')}`,
+        value,
+    ])
+
+    if (maybeSetOnce.length === 0) {
+        return false
+    }
+
+    const filteredMayBeSetOnce = maybeSetOnce.filter(([key]) => !initialCampaignParams.has(key))
+
+    const setOnce = new Map(Object.entries({ ...Object.fromEntries(maybeSetOnce), ...(properties.$set_once || {}) }))
+    const filteredSetOnce = new Map(
+        Object.entries({ ...Object.fromEntries(filteredMayBeSetOnce), ...(properties.$set_once || {}) })
+    )
+
+    return !areMapsEqual(setOnce, filteredSetOnce)
 }
 
-export function generateKafkaPersonUpdateMessage(
-    createdAt: DateTime | string,
-    properties: Properties,
-    teamId: number,
-    isIdentified: boolean,
-    id: string,
-    version: number | null,
-    isDeleted = 0
-): ProducerRecord {
+export function generateKafkaPersonUpdateMessage(person: InternalPerson, isDeleted = false): TopicMessage {
     return {
         topic: KAFKA_PERSON,
         messages: [
             {
-                value: Buffer.from(
-                    JSON.stringify({
-                        id,
-                        created_at: castTimestampOrNow(createdAt, TimestampFormat.ClickHouseSecondPrecision),
-                        properties: JSON.stringify(properties),
-                        team_id: teamId,
-                        is_identified: isIdentified,
-                        is_deleted: isDeleted,
-                        ...(version ? { version } : {}),
-                    })
-                ),
+                value: JSON.stringify({
+                    id: person.uuid,
+                    created_at: castTimestampOrNow(person.created_at, TimestampFormat.ClickHouseSecondPrecision),
+                    properties: JSON.stringify(person.properties),
+                    team_id: person.team_id,
+                    is_identified: Number(person.is_identified),
+                    is_deleted: Number(isDeleted),
+                    version: person.version + (isDeleted ? 100 : 0), // keep in sync with delete_person in posthog/models/person/util.py
+                } as Omit<ClickHousePerson, 'timestamp'>),
             },
         ],
     }
@@ -260,27 +206,55 @@ export function getFinalPostgresQuery(queryString: string, values: any[]): strin
     return queryString.replace(/\$([0-9]+)/g, (m, v) => JSON.stringify(values[parseInt(v) - 1]))
 }
 
-export function transformPostgresElementsToEventPayloadFormat(
-    rawElements: Record<string, any>[]
-): Record<string, any>[] {
-    const elementTransformations: Record<string, string> = {
-        text: '$el_text',
-        attr_class: 'attr__class',
-        attr_id: 'attr__id',
-        href: 'attr__href',
+export function shouldStoreLog(pluginLogLevel: PluginLogLevel, type: PluginLogEntryType): boolean {
+    switch (pluginLogLevel) {
+        case PluginLogLevel.Full:
+            return true
+        case PluginLogLevel.Log:
+            return type !== PluginLogEntryType.Debug
+        case PluginLogLevel.Info:
+            return type !== PluginLogEntryType.Log && type !== PluginLogEntryType.Debug
+        case PluginLogLevel.Warn:
+            return type === PluginLogEntryType.Warn || type === PluginLogEntryType.Error
+        case PluginLogLevel.Critical:
+            return type === PluginLogEntryType.Error
     }
-
-    const elements = []
-    for (const element of rawElements) {
-        for (const [key, val] of Object.entries(element)) {
-            if (key in elementTransformations) {
-                element[elementTransformations[key]] = val
-                delete element[key]
-            }
-        }
-        delete element['attributes']
-        elements.push(element)
-    }
-
-    return elements
 }
+
+// keep in sync with posthog/posthog/api/utils.py::safe_clickhouse_string
+export function safeClickhouseString(str: string): string {
+    // character is a surrogate
+    return str.replace(/[\ud800-\udfff]/gu, (match) => {
+        surrogatesSubstitutedCounter.inc()
+        const res = JSON.stringify(match)
+        return res.slice(1, res.length - 1) + `\\`
+    })
+}
+
+// JSONB columns may not contain null bytes, so we replace them with the Unicode replacement
+// character. This should be called before passing a parameter to a parameterized query. It is
+// designed to safely ignore other types, since we have some functions that operate on generic
+// parameter arrays.
+//
+// Objects are JSON serialized to make the replacement safer and less expensive, since we don't have
+// to recursively walk the object once its a string. They need to be JSON serialized before sending
+// to Postgres anyway.
+export function sanitizeJsonbValue(value: any): any {
+    if (value === null) {
+        // typeof null is 'object', but we don't want to serialize it into a string below
+        return value
+    } else if (typeof value === 'object') {
+        return JSON.stringify(value).replace(/\\u0000/g, '\\uFFFD')
+    } else {
+        return value
+    }
+}
+
+export function sanitizeString(value: string) {
+    return value.replace(/\u0000/g, '\uFFFD')
+}
+
+export const surrogatesSubstitutedCounter = new Counter({
+    name: 'surrogates_substituted_total',
+    help: 'Stray UTF16 surrogates detected and removed from user input.',
+})

@@ -4,11 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0179_add_group_type_mapping"),
     ]
 
     operations = [
-        migrations.AddField(model_name="person", name="version", field=models.BigIntegerField(blank=True, null=True),)
+        migrations.AddField(
+            model_name="person",
+            name="version",
+            field=models.BigIntegerField(blank=True, null=True),
+        )
     ]

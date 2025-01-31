@@ -1,29 +1,32 @@
-import { kea } from 'kea'
-import { groupPropertiesModelType } from './groupPropertiesModelType'
+import { connect, events, kea, path, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
 import api from 'lib/api'
-import { GroupTypeProperties, PersonProperty } from '~/types'
-import { teamLogic } from 'scenes/teamLogic'
-import { groupsModel } from './groupsModel'
+import { groupsAccessLogic } from 'lib/introductions/groupsAccessLogic'
+import { projectLogic } from 'scenes/projectLogic'
 
-export const groupPropertiesModel = kea<groupPropertiesModelType>({
-    path: ['models', 'groupPropertiesModel'],
-    connect: {
-        values: [teamLogic, ['currentTeamId'], groupsModel, ['groupsEnabled']],
-    },
-    loaders: ({ values }) => ({
+import { GroupTypeProperties, PersonProperty } from '~/types'
+
+import type { groupPropertiesModelType } from './groupPropertiesModelType'
+
+export const groupPropertiesModel = kea<groupPropertiesModelType>([
+    path(['models', 'groupPropertiesModel']),
+    connect({
+        values: [projectLogic, ['currentProjectId'], groupsAccessLogic, ['groupsEnabled']],
+    }),
+    loaders(({ values }) => ({
         allGroupProperties: [
             {} as GroupTypeProperties,
             {
                 loadAllGroupProperties: async () => {
                     if (values.groupsEnabled) {
-                        return await api.get(`api/projects/${values.currentTeamId}/groups/property_definitions`)
+                        return await api.get(`api/projects/${values.currentProjectId}/groups/property_definitions`)
                     }
                     return {}
                 },
             },
         ],
-    }),
-    selectors: {
+    })),
+    selectors({
         groupProperties: [
             (s) => [s.allGroupProperties],
             (groupProperties: GroupTypeProperties) =>
@@ -35,8 +38,8 @@ export const groupPropertiesModel = kea<groupPropertiesModelType>({
         groupProperties_2: [(s) => [s.allGroupProperties], (groupProperties) => groupProperties['2']],
         groupProperties_3: [(s) => [s.allGroupProperties], (groupProperties) => groupProperties['3']],
         groupProperties_4: [(s) => [s.allGroupProperties], (groupProperties) => groupProperties['4']],
-    },
-    events: ({ actions }) => ({
-        afterMount: actions.loadAllGroupProperties,
     }),
-})
+    events(({ actions }) => ({
+        afterMount: actions.loadAllGroupProperties,
+    })),
+])

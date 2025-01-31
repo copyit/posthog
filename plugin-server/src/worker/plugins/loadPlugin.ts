@@ -1,96 +1,85 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-import { Hub, PluginConfig, PluginJsonConfig } from '../../types'
+import { Hub, Plugin, PluginConfig, PluginJsonConfig } from '../../types'
 import { processError } from '../../utils/db/error'
-import { getFileFromArchive, pluginDigest } from '../../utils/utils'
+import { pluginDigest } from '../../utils/utils'
 
-export async function loadPlugin(server: Hub, pluginConfig: PluginConfig): Promise<boolean> {
+function readFileIfExists(baseDir: string, plugin: Plugin, file: string): string | null {
+    const fullPath = path.resolve(baseDir, plugin.url!.substring(5), file)
+    if (fs.existsSync(fullPath)) {
+        return fs.readFileSync(fullPath).toString()
+    }
+    return null
+}
+
+export async function loadPlugin(hub: Hub, pluginConfig: PluginConfig): Promise<boolean> {
     const { plugin } = pluginConfig
+    const isLocalPlugin = plugin?.plugin_type === 'local'
 
     if (!plugin) {
-        pluginConfig.vm?.failInitialization!()
+        pluginConfig.instance?.failInitialization!()
         return false
     }
 
+    // Inline plugins don't need "loading", and have no source files.
+    if (plugin.plugin_type === 'inline') {
+        await pluginConfig.instance?.initialize!('', pluginDigest(plugin))
+        return true
+    }
+
     try {
-        if (plugin.url?.startsWith('file:')) {
-            const pluginPath = path.resolve(server.BASE_DIR, plugin.url.substring(5))
-            const configPath = path.resolve(pluginPath, 'plugin.json')
-
-            let config: PluginJsonConfig = {}
-            if (fs.existsSync(configPath)) {
-                try {
-                    const jsonBuffer = fs.readFileSync(configPath)
-                    config = JSON.parse(jsonBuffer.toString())
-                } catch (e) {
-                    pluginConfig.vm?.failInitialization!()
-                    await processError(
-                        server,
-                        pluginConfig,
-                        `Could not load posthog config at "${configPath}" for ${pluginDigest(plugin)}`
-                    )
-                    return false
-                }
+        // load config json
+        const configJson = isLocalPlugin
+            ? readFileIfExists(hub.BASE_DIR, plugin, 'plugin.json')
+            : plugin.source__plugin_json
+        let config: PluginJsonConfig = {}
+        if (configJson) {
+            try {
+                config = JSON.parse(configJson)
+            } catch (e) {
+                pluginConfig.instance?.failInitialization!()
+                await processError(hub, pluginConfig, `Could not load "plugin.json" for ${pluginDigest(plugin)}`)
+                return false
             }
+        }
 
-            if (!config['main'] && !fs.existsSync(path.resolve(pluginPath, 'index.js'))) {
-                pluginConfig.vm?.failInitialization!()
+        // setup "backend" app
+        const pluginSource = isLocalPlugin
+            ? config['main']
+                ? readFileIfExists(hub.BASE_DIR, plugin, config['main'])
+                : readFileIfExists(hub.BASE_DIR, plugin, 'index.js') ||
+                  readFileIfExists(hub.BASE_DIR, plugin, 'index.ts')
+            : plugin.source__index_ts
+        if (pluginSource) {
+            void pluginConfig.instance?.initialize!(pluginSource, pluginDigest(plugin))
+            return true
+        } else {
+            // always call this if no backend app present, will signal that the VM is done
+            pluginConfig.instance?.failInitialization!()
+
+            // if there is a frontend or site app, don't save an error if no backend app
+            const hasFrontend = isLocalPlugin
+                ? readFileIfExists(hub.BASE_DIR, plugin, 'frontend.tsx')
+                : plugin['source__frontend_tsx']
+            const hasSite = isLocalPlugin
+                ? readFileIfExists(hub.BASE_DIR, plugin, 'site.ts')
+                : plugin['source__site_ts']
+
+            if (!hasFrontend && !hasSite) {
                 await processError(
-                    server,
+                    hub,
                     pluginConfig,
-                    `No "main" config key or "index.js" file found for ${pluginDigest(plugin)}`
+                    `Could not load source code for ${pluginDigest(plugin)}. Tried: ${
+                        config['main'] || 'index.ts, index.js'
+                    }`
                 )
                 return false
             }
-
-            const jsPath = path.resolve(pluginPath, config['main'] || 'index.js')
-            const indexJs = fs.readFileSync(jsPath).toString()
-
-            void pluginConfig.vm?.initialize!(
-                server,
-                pluginConfig,
-                indexJs,
-                `local ${pluginDigest(plugin)} from "${pluginPath}"!`
-            )
-            return true
-        } else if (plugin.archive) {
-            let config: PluginJsonConfig = {}
-            const archive = Buffer.from(plugin.archive)
-            const json = await getFileFromArchive(archive, 'plugin.json')
-            if (json) {
-                try {
-                    config = JSON.parse(json)
-                } catch (error) {
-                    pluginConfig.vm?.failInitialization!()
-                    await processError(server, pluginConfig, `Can not load plugin.json for ${pluginDigest(plugin)}`)
-                    return false
-                }
-            }
-
-            const indexJs = await getFileFromArchive(archive, config['main'] || 'index.js')
-
-            if (indexJs) {
-                void pluginConfig.vm?.initialize!(server, pluginConfig, indexJs, pluginDigest(plugin))
-                return true
-            } else {
-                pluginConfig.vm?.failInitialization!()
-                await processError(server, pluginConfig, `Could not load index.js for ${pluginDigest(plugin)}!`)
-            }
-        } else if (plugin.plugin_type === 'source' && plugin.source) {
-            void pluginConfig.vm?.initialize!(server, pluginConfig, plugin.source, pluginDigest(plugin))
-            return true
-        } else {
-            pluginConfig.vm?.failInitialization!()
-            await processError(
-                server,
-                pluginConfig,
-                `Tried using undownloaded remote ${pluginDigest(plugin)}, which is not supported!`
-            )
         }
     } catch (error) {
-        pluginConfig.vm?.failInitialization!()
-        await processError(server, pluginConfig, error)
+        pluginConfig.instance?.failInitialization!()
+        await processError(hub, pluginConfig, error)
     }
     return false
 }

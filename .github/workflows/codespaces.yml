@@ -21,15 +21,20 @@ on:
 jobs:
     build:
         name: Build Codespaces image
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-24.04
 
         # Build on master and PRs with the label 'codespaces-build' only
         if: ${{ github.ref == 'refs/heads/master' || contains(github.event.pull_request.labels.*.name, 'codespaces-build')  }}
 
         steps:
-            - uses: actions/checkout@v1
+            - uses: actions/checkout@v3
               with:
                   fetch-depth: 1
+
+            - name: Lowercase GITHUB_REPOSITORY
+              id: lowercase
+              run: |
+                  echo "repository=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
             # As ghcr.io complains if the image has upper case letters, we use
             # this action to ensure we get a lower case version. See
@@ -37,9 +42,9 @@ jobs:
             # for more details
             - name: Docker image metadata
               id: meta
-              uses: docker/metadata-action@v3
+              uses: docker/metadata-action@v5
               with:
-                  images: ghcr.io/${{ github.repository }}/codespaces
+                  images: ghcr.io/${{ steps.lowercase.outputs.repository }}/codespaces
                   tags: |
                       type=ref,event=branch
                       type=raw,value=master
@@ -49,21 +54,21 @@ jobs:
             # This creates a scope similar to the github cache action scoping
             - name: Docker cache-from/cache-to metadata
               id: meta-for-cache
-              uses: docker/metadata-action@v3
+              uses: docker/metadata-action@v5
               with:
-                  images: ghcr.io/${{ github.repository }}/codespaces
+                  images: ghcr.io/${{ steps.lowercase.outputs.repository }}/codespaces
                   tags: |
                       type=raw,value=master
 
             # Install QEMU so we can target x86_64 (github codespaces)
             - name: Set up QEMU
-              uses: docker/setup-qemu-action@v1
+              uses: docker/setup-qemu-action@v3
 
             - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@v1
+              uses: docker/setup-buildx-action@v2
 
             - name: Login to GitHub Container Registry
-              uses: docker/login-action@v1
+              uses: docker/login-action@v3
               with:
                   registry: ghcr.io
                   username: ${{ github.actor }}

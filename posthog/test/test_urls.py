@@ -1,16 +1,12 @@
 import uuid
 
-import pytest
-from django.conf import settings
 from rest_framework import status
 
-import posthog.urls
 from posthog.test.base import APIBaseTest
 
 
 class TestUrls(APIBaseTest):
     def test_logout_temporary_token_reset(self):
-
         # update temporary token
         self.user.temporary_token = "token123"
         self.user.save()
@@ -32,7 +28,7 @@ class TestUrls(APIBaseTest):
 
         # Complex URL
         response = self.client.get(
-            '/insights/new?interval=day&display=ActionsLineGraph&events=[{"id":"$pageview","name":"$pageview","type":"events","order":0}]&properties=[]',
+            '/insights/new?interval=day&display=ActionsLineGraph&events=[{"id":"$pageview","name":"$pageview","type":"events","order":0}]&properties=[]'
         )
 
         # Test that the URL is properly encoded to redirect the user to the final destination
@@ -43,7 +39,6 @@ class TestUrls(APIBaseTest):
         )
 
     def test_unauthenticated_routes_get_loaded_on_the_frontend(self):
-
         self.client.logout()
 
         response = self.client.get("/signup")
@@ -57,3 +52,53 @@ class TestUrls(APIBaseTest):
 
         response = self.client.get(f"/login")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_authorize_and_redirect_domain(self):
+        self.team.app_urls = ["https://domain.com", "https://not.com"]
+        self.team.save()
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=https://not-permitted.com",
+            HTTP_REFERER="https://not-permitted.com",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue("Can only redirect to a permitted domain." in str(response.content))
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=https://domain.com",
+            HTTP_REFERER="https://not.com",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue("Can only redirect to the same domain as the referer: not.com" in str(response.content))
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=http://domain.com",
+            HTTP_REFERER="https://domain.com",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue("Can only redirect to the same scheme as the referer: https" in str(response.content))
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=https://domain.com:555",
+            HTTP_REFERER="https://domain.com:443",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue("Can only redirect to the same port as the referer: 443" in str(response.content))
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=https://domain.com:555",
+            HTTP_REFERER="https://domain.com/no-port",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue("Can only redirect to the same port as the referer: no port in URL" in str(response.content))
+
+        response = self.client.get(
+            "/authorize_and_redirect/?redirect=https://domain.com/sdf",
+            HTTP_REFERER="https://domain.com/asd",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # TODO: build frontend before backend tests, or find a way to mock the template
+        # self.assertContains(
+        #     response,
+        #     "Do you want to give the PostHog Toolbar on <strong>https://domain.com/sdf</strong> access to your PostHog data?",
+        # )

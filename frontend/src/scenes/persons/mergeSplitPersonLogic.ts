@@ -1,62 +1,70 @@
-import { kea } from 'kea'
+import { actions, connect, events, kea, key, listeners, path, props, reducers } from 'kea'
+import { loaders } from 'kea-loaders'
 import { router } from 'kea-router'
 import api from 'lib/api'
-import { successToast } from 'lib/utils'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+
 import { PersonType } from '~/types'
-import { mergeSplitPersonLogicType } from './mergeSplitPersonLogicType'
+
+import type { mergeSplitPersonLogicType } from './mergeSplitPersonLogicType'
 import { personsLogic } from './personsLogic'
 
-export enum ActivityType {
-    SPLIT = 'split',
-    MERGE = 'merge',
-}
-
-interface SplitPersonLogicProps {
+export interface SplitPersonLogicProps {
     person: PersonType
 }
 
-type PersonIds = NonNullable<PersonType['id']>[]
+export type PersonUuids = NonNullable<PersonType['uuid']>[]
 
-export const mergeSplitPersonLogic = kea<mergeSplitPersonLogicType<ActivityType, PersonIds, SplitPersonLogicProps>>({
-    props: {} as SplitPersonLogicProps,
-    key: (props) => props.person.id,
-    path: (key) => ['scenes', 'persons', 'mergeSplitPersonLogic', key || 'new'],
-    connect: () => ({
+export const mergeSplitPersonLogic = kea<mergeSplitPersonLogicType>([
+    props({} as SplitPersonLogicProps),
+    key((props) => props.person.id ?? 'new'),
+    path((key) => ['scenes', 'persons', 'mergeSplitPersonLogic', key]),
+    connect(() => ({
         actions: [
             personsLogic({ syncWithUrl: true }),
             ['setListFilters', 'loadPersons', 'setPerson', 'setSplitMergeModalShown'],
         ],
         values: [personsLogic({ syncWithUrl: true }), ['persons']],
-    }),
-    actions: {
-        setActivity: (activity: ActivityType) => ({ activity }),
-        setSelectedPersonsToMerge: (persons: PersonIds) => ({ persons }),
+    })),
+    actions({
         setSelectedPersonToAssignSplit: (id: string) => ({ id }),
         cancel: true,
-    },
-    reducers: ({ props }) => ({
-        activity: [
-            ActivityType.MERGE,
+    }),
+    loaders(({ values, actions }) => ({
+        executed: [
+            false,
             {
-                setActivity: (_, { activity }) => activity,
+                execute: async () => {
+                    const splitAction = await api.create('api/person/' + values.person.id + '/split/', {
+                        ...(values.selectedPersonToAssignSplit
+                            ? { main_distinct_id: values.selectedPersonToAssignSplit }
+                            : {}),
+                    })
+                    if (splitAction.success) {
+                        lemonToast.success(
+                            'Person succesfully split. This may take up to a couple of minutes to complete.'
+                        )
+                        eventUsageLogic.actions.reportPersonSplit(values.person.distinct_ids.length)
+                        actions.setSplitMergeModalShown(false)
+                        router.actions.push('/persons')
+                        return true
+                    }
+                    return false
+                },
             },
         ],
+    })),
+    reducers(({ props }) => ({
         person: [props.person, {}],
-        selectedPersonsToMerge: [
-            [] as PersonIds,
-            {
-                setSelectedPersonsToMerge: (_, { persons }) => persons,
-            },
-        ],
-        selectedPersonsToAssignSplit: [
+        selectedPersonToAssignSplit: [
             null as null | string,
             {
                 setSelectedPersonToAssignSplit: (_, { id }) => id,
             },
         ],
-    }),
-    listeners: ({ actions, values }) => ({
+    })),
+    listeners(({ actions, values }) => ({
         setListFilters: () => {
             actions.loadPersons()
         },
@@ -65,49 +73,8 @@ export const mergeSplitPersonLogic = kea<mergeSplitPersonLogicType<ActivityType,
                 actions.setSplitMergeModalShown(false)
             }
         },
-    }),
-    loaders: ({ values, actions }) => ({
-        executed: [
-            false,
-            {
-                execute: async () => {
-                    if (values.activity === ActivityType.MERGE) {
-                        const newPerson = await api.create('api/person/' + values.person.id + '/merge/', {
-                            ids: values.selectedPersonsToMerge,
-                        })
-                        if (newPerson.id) {
-                            successToast(
-                                'Persons succesfully merged.',
-                                'All users have been succesfully merged. Changes should take effect immediately.'
-                            )
-                            eventUsageLogic.actions.reportPersonMerged(values.selectedPersonsToMerge.length)
-                            actions.setSplitMergeModalShown(false)
-                            actions.setPerson(newPerson)
-                            return true
-                        }
-                    } else {
-                        const splitAction = await api.create('api/person/' + values.person.id + '/split/', {
-                            ...(values.selectedPersonsToAssignSplit
-                                ? { main_distinct_id: values.selectedPersonsToAssignSplit }
-                                : {}),
-                        })
-                        if (splitAction.success) {
-                            successToast(
-                                'Person succesfully split.',
-                                'We are in the process of splitting this person. It may take up to a couple of minutes to complete.'
-                            )
-                            eventUsageLogic.actions.reportPersonSplit(values.person.distinct_ids.length)
-                            actions.setSplitMergeModalShown(false)
-                            router.actions.push('/persons')
-                            return true
-                        }
-                    }
-                    return false
-                },
-            },
-        ],
-    }),
-    events: ({ actions }) => ({
+    })),
+    events(({ actions }) => ({
         afterMount: [actions.loadPersons],
-    }),
-})
+    })),
+])

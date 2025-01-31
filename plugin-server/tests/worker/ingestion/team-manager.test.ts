@@ -1,12 +1,11 @@
-import { mocked } from 'ts-jest/utils'
+import { Settings } from 'luxon'
 
-import { Hub } from '../../../src/types'
-import { createHub } from '../../../src/utils/db/hub'
-import { posthog } from '../../../src/utils/posthog'
-import { UUIDT } from '../../../src/utils/utils'
+import { defaultConfig } from '../../../src/config/config'
+import { PostgresRouter, PostgresUse } from '../../../src/utils/db/postgres'
 import { TeamManager } from '../../../src/worker/ingestion/team-manager'
 import { resetTestDatabase } from '../../helpers/sql'
 
+jest.mock('../../../src/utils/status')
 jest.mock('../../../src/utils/posthog', () => ({
     posthog: {
         identify: jest.fn(),
@@ -15,45 +14,51 @@ jest.mock('../../../src/utils/posthog', () => ({
 }))
 
 describe('TeamManager()', () => {
-    let hub: Hub
-    let closeHub: () => Promise<void>
     let teamManager: TeamManager
+    let postgres: PostgresRouter
 
     beforeEach(async () => {
-        ;[hub, closeHub] = await createHub()
         await resetTestDatabase()
-        teamManager = hub.teamManager
+        postgres = new PostgresRouter(defaultConfig, undefined)
+        teamManager = new TeamManager(postgres, defaultConfig)
+        Settings.defaultZoneName = 'utc'
     })
+
     afterEach(async () => {
-        await closeHub()
+        await postgres.end()
     })
 
     describe('fetchTeam()', () => {
         it('fetches and caches the team', async () => {
-            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27 11:00:05').getTime())
-            jest.spyOn(hub.db, 'postgresQuery')
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:00:05Z').getTime())
+            jest.spyOn(postgres, 'query')
 
             let team = await teamManager.fetchTeam(2)
             expect(team!.name).toEqual('TEST PROJECT')
             // expect(team!.__fetch_event_uuid).toEqual('uuid1')
 
-            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27 11:00:25').getTime())
-            await hub.db.postgresQuery("UPDATE posthog_team SET name = 'Updated Name!'", undefined, 'testTag')
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:00:55Z').getTime())
+            await postgres.query(
+                PostgresUse.COMMON_WRITE,
+                "UPDATE posthog_team SET name = 'Updated Name!'",
+                undefined,
+                'testTag'
+            )
 
-            mocked(hub.db.postgresQuery).mockClear()
+            jest.mocked(postgres.query).mockClear()
 
             team = await teamManager.fetchTeam(2)
             expect(team!.name).toEqual('TEST PROJECT')
             // expect(team!.__fetch_event_uuid).toEqual('uuid1')
-            expect(hub.db.postgresQuery).toHaveBeenCalledTimes(0)
+            expect(postgres.query).toHaveBeenCalledTimes(0)
 
-            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27 11:00:36').getTime())
+            // 2min have passed i.e. the cache should have expired
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:02:06Z').getTime())
 
             team = await teamManager.fetchTeam(2)
             expect(team!.name).toEqual('Updated Name!')
-            // expect(team!.__fetch_event_uuid).toEqual('uuid3')
 
-            expect(hub.db.postgresQuery).toHaveBeenCalledTimes(1)
+            expect(postgres.query).toHaveBeenCalledTimes(1)
         })
 
         it('returns null when no such team', async () => {
@@ -61,148 +66,74 @@ describe('TeamManager()', () => {
         })
     })
 
-    describe('updateEventNamesAndProperties()', () => {
-        beforeEach(async () => {
-            await hub.db.postgresQuery("UPDATE posthog_team SET ingested_event = 't'", undefined, 'testTag')
-            await hub.db.postgresQuery('DELETE FROM posthog_eventdefinition', undefined, 'testTag')
-            await hub.db.postgresQuery('DELETE FROM posthog_propertydefinition', undefined, 'testTag')
-            await hub.db.postgresQuery(
-                `INSERT INTO posthog_eventdefinition (id, name, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, $3, $4, $5)`,
-                [new UUIDT().toString(), '$pageview', 3, 2, 2],
+    describe('getTeamByToken()', () => {
+        it('caches positive lookups for 2 minutes', async () => {
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:00:05Z').getTime())
+            await postgres.query(
+                PostgresUse.COMMON_WRITE,
+                "UPDATE posthog_team SET api_token = 'my_token'",
+                undefined,
                 'testTag'
             )
-            await hub.db.postgresQuery(
-                `INSERT INTO posthog_propertydefinition (id, name, is_numerical, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, $3, $4, $5, $6)`,
-                [new UUIDT().toString(), 'property_name', false, null, null, 2],
+
+            // Initial lookup hits the DB and returns null
+            jest.spyOn(postgres, 'query')
+            let team = await teamManager.getTeamByToken('my_token')
+            expect(postgres.query).toHaveBeenCalledTimes(1)
+            expect(team!.id).toEqual(2)
+            expect(team!.anonymize_ips).toEqual(false)
+
+            // Settings are updated
+            await postgres.query(
+                PostgresUse.COMMON_WRITE,
+                'UPDATE posthog_team SET anonymize_ips = true',
+                undefined,
                 'testTag'
             )
-            await hub.db.postgresQuery(
-                `INSERT INTO posthog_propertydefinition (id, name, is_numerical, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, $3, $4, $5, $6)`,
-                [new UUIDT().toString(), 'numeric_prop', true, null, null, 2],
-                'testTag'
-            )
+
+            // Second lookup hits the cache and skips the DB lookup, setting is stale
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:01:56Z').getTime())
+            jest.mocked(postgres.query).mockClear()
+            team = await teamManager.getTeamByToken('my_token')
+            expect(postgres.query).toHaveBeenCalledTimes(0)
+            expect(team!.id).toEqual(2)
+            expect(team!.anonymize_ips).toEqual(false)
+
+            // Setting change take effect after cache expiration
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:25:06Z').getTime())
+            jest.mocked(postgres.query).mockClear()
+            team = await teamManager.getTeamByToken('my_token')
+            expect(postgres.query).toHaveBeenCalledTimes(1)
+            expect(team!.id).toEqual(2)
+            expect(team!.anonymize_ips).toEqual(true)
         })
 
-        it('updates event properties', async () => {
-            await teamManager.updateEventNamesAndProperties(2, 'new-event', {
-                property_name: 'efg',
-                number: 4,
-                numeric_prop: 5,
-            })
-            teamManager.teamCache.clear()
+        it('caches negative lookups for 5 minutes', async () => {
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:00:05Z').getTime())
 
-            expect(await hub.db.fetchEventDefinitions()).toEqual([
-                {
-                    id: expect.any(String),
-                    name: '$pageview',
-                    query_usage_30_day: 2,
-                    team_id: 2,
-                    volume_30_day: 3,
-                },
-                {
-                    id: expect.any(String),
-                    name: 'new-event',
-                    query_usage_30_day: null,
-                    team_id: 2,
-                    volume_30_day: null,
-                },
-            ])
-            expect(await hub.db.fetchPropertyDefinitions()).toEqual([
-                {
-                    id: expect.any(String),
-                    is_numerical: false,
-                    name: 'property_name',
-                    query_usage_30_day: null,
-                    team_id: 2,
-                    volume_30_day: null,
-                },
-                {
-                    id: expect.any(String),
-                    is_numerical: true,
-                    name: 'numeric_prop',
-                    query_usage_30_day: null,
-                    team_id: 2,
-                    volume_30_day: null,
-                },
-                {
-                    id: expect.any(String),
-                    is_numerical: true,
-                    name: 'number',
-                    query_usage_30_day: null,
-                    team_id: 2,
-                    volume_30_day: null,
-                },
-            ])
+            // Initial lookup hits the DB and returns null
+            jest.spyOn(postgres, 'query')
+            expect(await teamManager.getTeamByToken('unknown')).toEqual(null)
+            expect(postgres.query).toHaveBeenCalledTimes(1)
+
+            // Second lookup hits the cache and skips the DB lookup
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:03:06Z').getTime())
+            jest.mocked(postgres.query).mockClear()
+            expect(await teamManager.getTeamByToken('unknown')).toEqual(null)
+            expect(postgres.query).toHaveBeenCalledTimes(0)
+
+            // Hit the DB on cache expiration
+            jest.spyOn(global.Date, 'now').mockImplementation(() => new Date('2020-02-27T11:05:06Z').getTime())
+            jest.mocked(postgres.query).mockClear()
+            expect(await teamManager.getTeamByToken('unknown')).toEqual(null)
+            expect(postgres.query).toHaveBeenCalledTimes(1)
         })
 
-        it('does not update anything if nothing changes', async () => {
-            await teamManager.fetchTeam(2)
-            await teamManager.cacheEventNamesAndProperties(2)
-            jest.spyOn(hub.db, 'postgresQuery')
-
-            await teamManager.updateEventNamesAndProperties(2, '$pageview', {})
-
-            expect(hub.db.postgresQuery).not.toHaveBeenCalled()
-        })
-
-        it('does not capture event', async () => {
-            await teamManager.updateEventNamesAndProperties(2, 'new-event', { property_name: 'efg', number: 4 })
-
-            expect(posthog.identify).not.toHaveBeenCalled()
-            expect(posthog.capture).not.toHaveBeenCalled()
-        })
-
-        it('handles cache invalidation properly', async () => {
-            await teamManager.fetchTeam(2)
-            await teamManager.cacheEventNamesAndProperties(2)
-            await hub.db.postgresQuery(
-                `INSERT INTO posthog_eventdefinition (id, name, volume_30_day, query_usage_30_day, team_id) VALUES ($1, $2, NULL, NULL, $3) ON CONFLICT DO NOTHING`,
-                [new UUIDT().toString(), '$foobar', 2],
-                'insertEventDefinition'
-            )
-
-            jest.spyOn(teamManager, 'fetchTeam')
-            jest.spyOn(hub.db, 'postgresQuery')
-
-            // Scenario: Different request comes in, team gets reloaded in the background with no updates
-            await teamManager.updateEventNamesAndProperties(2, '$foobar', {})
-            expect(teamManager.fetchTeam).toHaveBeenCalledTimes(1)
-            expect(hub.db.postgresQuery).toHaveBeenCalledTimes(1)
-
-            // Scenario: Next request but a real update
-            mocked(teamManager.fetchTeam).mockClear()
-            mocked(hub.db.postgresQuery).mockClear()
-
-            await teamManager.updateEventNamesAndProperties(2, '$newevent', {})
-            expect(teamManager.fetchTeam).toHaveBeenCalledTimes(1)
-            expect(hub.db.postgresQuery).toHaveBeenCalledTimes(1)
-        })
-
-        describe('first event has not yet been ingested', () => {
-            beforeEach(async () => {
-                await hub.db.postgresQuery('UPDATE posthog_team SET ingested_event = false', undefined, 'testTag')
-            })
-
-            it('calls posthog.identify and posthog.capture', async () => {
-                await teamManager.updateEventNamesAndProperties(2, 'new-event', {
-                    $lib: 'python',
-                    host: 'localhost:8000',
-                })
-
-                const team = await teamManager.fetchTeam(2)
-                expect(posthog.identify).toHaveBeenCalledWith('plugin_test_user_distinct_id_1001')
-                expect(posthog.capture).toHaveBeenCalledWith('first team event ingested', {
-                    team: team!.uuid,
-                    host: 'localhost:8000',
-                    realm: undefined,
-                    sdk: 'python',
-                    $groups: {
-                        organization: 'ca30f2ec-e9a4-4001-bf27-3ef194086068',
-                        project: team!.uuid,
-                        instance: 'unknown',
-                    },
-                })
-            })
+        it('throws on postgres errors', async () => {
+            postgres.query = jest.fn().mockRejectedValue(new Error('PG unavailable'))
+            await expect(async () => {
+                await teamManager.getTeamByToken('another')
+            }).rejects.toThrow('PG unavailable')
         })
     })
 })

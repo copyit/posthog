@@ -1,4 +1,6 @@
-import { Hub, PluginConfig } from '../../../types'
+import { Counter } from 'prom-client'
+
+import { Hub, PluginConfig, PluginLogEntryType } from '../../../types'
 
 type JobRunner = {
     runAt: (date: Date) => Promise<void>
@@ -37,15 +39,38 @@ export function durationToMs(duration: number, unit: string): number {
     return durations[unit] * duration
 }
 
+const pluginJobEnqueueCounter = new Counter({
+    name: 'plugin_job_enqueue_total',
+    help: 'Count of plugin jobs enqueued',
+    labelNames: ['plugin_id'],
+})
+
 export function createJobs(server: Hub, pluginConfig: PluginConfig): Jobs {
+    /**
+     * Helper function to enqueue jobs to be executed by the jobs pool.
+     * To avoid disruptions if the Graphile PG is unhealthy, job payloads are
+     * written to a Kafka topic.
+     * job-consumer.ts will consume and place them in the Graphile queue asynchronously.
+     */
     const runJob = async (type: string, payload: Record<string, any>, timestamp: number) => {
-        await server.jobQueueManager.enqueue({
-            type,
-            payload,
-            timestamp,
-            pluginConfigId: pluginConfig.id,
-            pluginConfigTeam: pluginConfig.team_id,
-        })
+        try {
+            const job = {
+                type,
+                payload,
+                timestamp,
+                pluginConfigId: pluginConfig.id,
+                pluginConfigTeam: pluginConfig.team_id,
+            }
+            pluginJobEnqueueCounter.labels(String(pluginConfig.plugin?.id)).inc()
+            await server.enqueuePluginJob(job)
+        } catch (e) {
+            await pluginConfig.instance?.createLogEntry(
+                `Failed to enqueue job ${type} with error: ${e.message}`,
+                PluginLogEntryType.Error
+            )
+
+            throw e
+        }
     }
 
     return new Proxy(

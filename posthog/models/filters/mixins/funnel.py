@@ -1,6 +1,6 @@
 import datetime
 import json
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 from posthog.models.property import Property
 
@@ -35,6 +35,7 @@ from posthog.constants import (
     FUNNEL_VIZ_TYPE,
     FUNNEL_WINDOW_DAYS,
     FUNNEL_WINDOW_INTERVAL,
+    FUNNEL_WINDOW_INTERVAL_TYPES,
     FUNNEL_WINDOW_INTERVAL_UNIT,
     INSIGHT,
     INSIGHT_FUNNELS,
@@ -42,8 +43,9 @@ from posthog.constants import (
     FunnelCorrelationType,
     FunnelOrderType,
     FunnelVizType,
+    FUNNEL_AGGREAGTE_BY_HOGQL,
 )
-from posthog.models.filters.mixins.base import BaseParamMixin, IntervalType
+from posthog.models.filters.mixins.base import BaseParamMixin, FunnelWindowIntervalType
 from posthog.models.filters.mixins.utils import cached_property, include_dict
 from posthog.utils import relative_date_parse, str_to_bool
 
@@ -103,23 +105,25 @@ class FunnelWindowMixin(BaseParamMixin):
         return _amt
 
     @cached_property
-    def funnel_window_interval_unit(self) -> Optional[IntervalType]:
+    def funnel_window_interval_unit(self) -> Optional[FunnelWindowIntervalType]:
         _unit = self._data.get(FUNNEL_WINDOW_INTERVAL_UNIT, None)
         return _unit.lower() if _unit is not None else _unit
 
     @include_dict
     def funnel_window_to_dict(self):
-        dict_part: Dict = {}
+        dict_part: dict = {}
         if self.funnel_window_interval is not None:
             dict_part[FUNNEL_WINDOW_INTERVAL] = self.funnel_window_interval
         if self.funnel_window_interval_unit is not None:
             dict_part[FUNNEL_WINDOW_INTERVAL_UNIT] = self.funnel_window_interval_unit
         return dict_part
 
-    def funnel_window_interval_unit_ch(self) -> Literal["DAY", "MINUTE", "HOUR", "WEEK", "MONTH"]:
+    def funnel_window_interval_unit_ch(self) -> FUNNEL_WINDOW_INTERVAL_TYPES:
         if self.funnel_window_interval_unit is None:
             return "DAY"
 
+        if self.funnel_window_interval_unit == "second":
+            return "SECOND"
         if self.funnel_window_interval_unit == "minute":
             return "MINUTE"
         elif self.funnel_window_interval_unit == "hour":
@@ -150,7 +154,7 @@ class FunnelPersonsStepMixin(BaseParamMixin):
         return int(_step_as_string)
 
     @cached_property
-    def funnel_custom_steps(self) -> List[int]:
+    def funnel_custom_steps(self) -> list[int]:
         """
         Custom step numbers to get persons for. This overrides FunnelPersonsStepMixin::funnel_step
         """
@@ -172,7 +176,7 @@ class FunnelPersonsStepMixin(BaseParamMixin):
 
 class FunnelPersonsStepBreakdownMixin(BaseParamMixin):
     @cached_property
-    def funnel_step_breakdown(self) -> Optional[Union[List[str], int, str]]:
+    def funnel_step_breakdown(self) -> Optional[Union[list[str], int, str]]:
         """
         The breakdown value for which to get persons for.
 
@@ -207,6 +211,16 @@ class FunnelLayoutMixin(BaseParamMixin):
         return {FUNNEL_LAYOUT: self.layout} if self.layout else {}
 
 
+class FunnelHogQLAggregationMixin(BaseParamMixin):
+    @cached_property
+    def funnel_aggregate_by_hogql(self) -> Optional[str]:
+        return self._data.get(FUNNEL_AGGREAGTE_BY_HOGQL)
+
+    @include_dict
+    def funnel_aggregate_by_hogql_to_dict(self):
+        return {FUNNEL_AGGREAGTE_BY_HOGQL: self.funnel_aggregate_by_hogql} if self.funnel_aggregate_by_hogql else {}
+
+
 class FunnelTypeMixin(BaseParamMixin):
     @cached_property
     def funnel_order_type(self) -> Optional[FunnelOrderType]:
@@ -227,7 +241,7 @@ class FunnelTypeMixin(BaseParamMixin):
 
     @include_dict
     def funnel_type_to_dict(self):
-        result: Dict[str, str] = {}
+        result: dict[str, str] = {}
         if self.funnel_order_type:
             result[FUNNEL_ORDER_TYPE] = self.funnel_order_type
         if self.funnel_viz_type:
@@ -250,7 +264,11 @@ class FunnelTrendsPersonsMixin(BaseParamMixin):
     @cached_property
     def entrance_period_start(self) -> Optional[datetime.datetime]:
         entrance_period_start_raw = self._data.get(ENTRANCE_PERIOD_START)
-        return relative_date_parse(entrance_period_start_raw) if entrance_period_start_raw else None
+        return (
+            relative_date_parse(entrance_period_start_raw, self.team.timezone_info)  # type: ignore
+            if entrance_period_start_raw
+            else None
+        )
 
     @cached_property
     def drop_off(self) -> Optional[bool]:
@@ -259,7 +277,7 @@ class FunnelTrendsPersonsMixin(BaseParamMixin):
 
     @include_dict
     def funnel_trends_persons_to_dict(self):
-        result_dict: Dict = {}
+        result_dict: dict = {}
         if self.entrance_period_start:
             result_dict[ENTRANCE_PERIOD_START] = self.entrance_period_start.isoformat()
         if self.drop_off is not None:
@@ -280,7 +298,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return None
 
     @cached_property
-    def correlation_property_names(self) -> List[str]:
+    def correlation_property_names(self) -> list[str]:
         # Person Property names for which to run Person Properties correlation
         property_names = self._data.get(FUNNEL_CORRELATION_NAMES, [])
         if isinstance(property_names, str):
@@ -288,7 +306,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return property_names
 
     @cached_property
-    def correlation_property_exclude_names(self) -> List[str]:
+    def correlation_property_exclude_names(self) -> list[str]:
         # Person Property names to exclude from Person Properties correlation
         property_names = self._data.get(FUNNEL_CORRELATION_EXCLUDE_NAMES, [])
         if isinstance(property_names, str):
@@ -296,7 +314,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return property_names
 
     @cached_property
-    def correlation_event_names(self) -> List[str]:
+    def correlation_event_names(self) -> list[str]:
         # Event names for which to run EventWithProperties correlation
         event_names = self._data.get(FUNNEL_CORRELATION_EVENT_NAMES, [])
         if isinstance(event_names, str):
@@ -304,7 +322,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return event_names
 
     @cached_property
-    def correlation_event_exclude_names(self) -> List[str]:
+    def correlation_event_exclude_names(self) -> list[str]:
         # Exclude event names from Event correlation
         property_names = self._data.get(FUNNEL_CORRELATION_EXCLUDE_EVENT_NAMES, [])
         if isinstance(property_names, str):
@@ -312,7 +330,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return property_names
 
     @cached_property
-    def correlation_event_exclude_property_names(self) -> List[str]:
+    def correlation_event_exclude_property_names(self) -> list[str]:
         # Event Property names to exclude from EventWithProperties correlation
         property_names = self._data.get(FUNNEL_CORRELATION_EVENT_EXCLUDE_PROPERTY_NAMES, [])
         if isinstance(property_names, str):
@@ -321,7 +339,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
 
     @include_dict
     def funnel_correlation_to_dict(self):
-        result_dict: Dict = {}
+        result_dict: dict = {}
         if self.correlation_type:
             result_dict[FUNNEL_CORRELATION_TYPE] = self.correlation_type
         if self.correlation_property_names:
@@ -337,7 +355,7 @@ class FunnelCorrelationMixin(BaseParamMixin):
         return result_dict
 
 
-class FunnelCorrelationPersonsMixin(BaseParamMixin):
+class FunnelCorrelationActorsMixin(BaseParamMixin):
     @cached_property
     def correlation_person_entity(self) -> Optional["Entity"]:
         # Used for event & event_with_properties correlations persons
@@ -352,7 +370,7 @@ class FunnelCorrelationPersonsMixin(BaseParamMixin):
         return Entity(event) if event else None
 
     @cached_property
-    def correlation_property_values(self) -> Optional[List[Property]]:
+    def correlation_property_values(self) -> Optional[list[Property]]:
         # Used for property correlations persons
 
         _props = self._data.get(FUNNEL_CORRELATION_PROPERTY_VALUES)
@@ -403,7 +421,7 @@ class FunnelCorrelationPersonsMixin(BaseParamMixin):
 
     @include_dict
     def funnel_correlation_persons_to_dict(self):
-        result_dict: Dict = {}
+        result_dict: dict = {}
         if self.correlation_person_entity:
             result_dict[FUNNEL_CORRELATION_PERSON_ENTITY] = self.correlation_person_entity.to_dict()
         if self.correlation_property_values:
@@ -417,3 +435,16 @@ class FunnelCorrelationPersonsMixin(BaseParamMixin):
         if self.correlation_persons_converted is not None:
             result_dict[FUNNEL_CORRELATION_PERSON_CONVERTED] = self.correlation_persons_converted
         return result_dict
+
+    @cached_property
+    def include_final_matching_events(self) -> bool:
+        # If true, actor query will include the user's final event in the funnel for recordings
+        return self._data.get("include_final_matching_events", False)
+
+    @include_dict
+    def include_final_matching_events_to_dict(self):
+        return (
+            {"include_final_matching_events": self.include_final_matching_events}
+            if self.include_final_matching_events
+            else {}
+        )

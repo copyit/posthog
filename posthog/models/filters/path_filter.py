@@ -1,23 +1,30 @@
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from rest_framework.request import Request
 
 from posthog.constants import INSIGHT_PATHS
-from posthog.models.filters.base_filter import BaseFilter
-from posthog.models.filters.mixins.common import (
+from .base_filter import BaseFilter
+from .mixins.common import (
     BreakdownMixin,
+    ClientQueryIdMixin,
     DateMixin,
     EntitiesMixin,
     FilterTestAccountsMixin,
+    IncludeRecordingsMixin,
     InsightMixin,
-    IntervalMixin,
     LimitMixin,
     OffsetMixin,
+    SampleMixin,
+    SearchMixin,
 )
-from posthog.models.filters.mixins.funnel import FunnelCorrelationMixin, FunnelPersonsStepMixin, FunnelWindowMixin
-from posthog.models.filters.mixins.groups import GroupsAggregationMixin
-from posthog.models.filters.mixins.paths import (
-    ComparatorDerivedMixin,
+from .mixins.funnel import (
+    FunnelCorrelationMixin,
+    FunnelPersonsStepMixin,
+    FunnelWindowMixin,
+)
+from .mixins.groups import GroupsAggregationMixin
+from .mixins.interval import IntervalMixin
+from .mixins.paths import (
     EndPointMixin,
     FunnelPathsMixin,
     LocalPathCleaningFiltersMixin,
@@ -26,21 +33,17 @@ from posthog.models.filters.mixins.paths import (
     PathPersonsMixin,
     PathReplacementMixin,
     PathStepLimitMixin,
-    PropTypeDerivedMixin,
     StartPointMixin,
-    TargetEventDerivedMixin,
     TargetEventsMixin,
+    PathsHogQLExpressionMixin,
 )
-from posthog.models.filters.mixins.property import PropertyMixin
-from posthog.models.filters.mixins.simplify import SimplifyFilterMixin
+from .mixins.property import PropertyMixin
+from .mixins.simplify import SimplifyFilterMixin
 
 
 class PathFilter(
     StartPointMixin,
     EndPointMixin,
-    TargetEventDerivedMixin,
-    ComparatorDerivedMixin,
-    PropTypeDerivedMixin,
     PropertyMixin,
     IntervalMixin,
     InsightMixin,
@@ -48,6 +51,7 @@ class PathFilter(
     DateMixin,
     BreakdownMixin,
     EntitiesMixin,
+    PathsHogQLExpressionMixin,
     PathStepLimitMixin,
     FunnelPathsMixin,
     TargetEventsMixin,
@@ -62,11 +66,20 @@ class PathFilter(
     PathLimitsMixin,
     GroupsAggregationMixin,
     FunnelCorrelationMixin,  # Typing pain because ColumnOptimizer expects a uniform filter
+    ClientQueryIdMixin,
     SimplifyFilterMixin,
+    IncludeRecordingsMixin,
+    SearchMixin,
     # TODO: proper fix for EventQuery abstraction
     BaseFilter,
+    SampleMixin,
 ):
-    def __init__(self, data: Optional[Dict[str, Any]] = None, request: Optional[Request] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        data: Optional[dict[str, Any]] = None,
+        request: Optional[Request] = None,
+        **kwargs,
+    ) -> None:
         if data:
             data["insight"] = INSIGHT_PATHS
         else:

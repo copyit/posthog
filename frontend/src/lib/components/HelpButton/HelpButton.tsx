@@ -1,28 +1,38 @@
-import React from 'react'
 import './HelpButton.scss'
-import { kea, useActions, useValues } from 'kea'
-import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
-import { HelpType } from '~/types'
-import { helpButtonLogicType } from './HelpButtonType'
-import { Popup } from '../Popup/Popup'
-import { Placement } from '@popperjs/core'
-import { LemonButton } from '../LemonButton'
-import { IconArrowDropDown, IconArticle, IconGithub, IconHelpOutline, IconMail, IconQuestionAnswer } from '../icons'
+
+import { Placement } from '@floating-ui/react'
+import { IconBug, IconChevronDown, IconDocument, IconQuestion, IconSupport } from '@posthog/icons'
 import clsx from 'clsx'
+import { actions, connect, kea, key, listeners, path, props, reducers, useActions, useValues } from 'kea'
+import { IconFeedback, IconQuestionAnswer } from 'lib/lemon-ui/icons'
+import { LemonMenu } from 'lib/lemon-ui/LemonMenu'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+
+import { HelpType } from '~/types'
+
+import { supportLogic } from '../Support/supportLogic'
+import type { helpButtonLogicType } from './HelpButtonType'
 
 const HELP_UTM_TAGS = '?utm_medium=in-product&utm_campaign=help-button-top'
 
-export const helpButtonLogic = kea<helpButtonLogicType>({
-    path: ['lib', 'components', 'HelpButton', 'HelpButton'],
-    connect: {
+export const helpButtonLogic = kea<helpButtonLogicType>([
+    props(
+        {} as {
+            key?: string
+        }
+    ),
+    key((props: { key?: string }) => props.key || 'global'),
+    path((key) => ['lib', 'components', 'HelpButton', key]),
+    connect({
         actions: [eventUsageLogic, ['reportHelpButtonViewed']],
-    },
-    actions: {
+    }),
+    actions({
         toggleHelp: true,
         showHelp: true,
         hideHelp: true,
-    },
-    reducers: {
+    }),
+    reducers({
         isHelpVisible: [
             false,
             {
@@ -31,8 +41,8 @@ export const helpButtonLogic = kea<helpButtonLogicType>({
                 hideHelp: () => false,
             },
         ],
-    },
-    listeners: ({ actions, values }) => ({
+    }),
+    listeners(({ actions, values }) => ({
         showHelp: () => {
             actions.reportHelpButtonViewed()
         },
@@ -41,94 +51,112 @@ export const helpButtonLogic = kea<helpButtonLogicType>({
                 actions.reportHelpButtonViewed()
             }
         },
-    }),
-})
+    })),
+])
 
 export interface HelpButtonProps {
     placement?: Placement
     customComponent?: JSX.Element
-    inline?: boolean // Whether the component should be an inline element as opposed to a block element
+    customKey?: string
+    /** Whether the component should be an inline element as opposed to a block element. */
+    inline?: boolean
+    /** Whether only options abount contact with PostHog should be shown (e.g. leaving docs out). */
+    contactOnly?: boolean
 }
 
-export function HelpButton({ placement, customComponent, inline }: HelpButtonProps): JSX.Element {
+export function HelpButton({
+    placement,
+    customComponent,
+    customKey,
+    inline = false,
+    contactOnly = false,
+}: HelpButtonProps): JSX.Element | null {
     const { reportHelpButtonUsed } = useActions(eventUsageLogic)
-    const { isHelpVisible } = useValues(helpButtonLogic)
-    const { toggleHelp, hideHelp } = useActions(helpButtonLogic)
+    const { isHelpVisible } = useValues(helpButtonLogic({ key: customKey }))
+    const { toggleHelp, hideHelp } = useActions(helpButtonLogic({ key: customKey }))
+    const { openSupportForm } = useActions(supportLogic)
+    const { isCloudOrDev } = useValues(preflightLogic)
+
+    const showSupportOptions: boolean = isCloudOrDev || false
+
+    if (contactOnly && !showSupportOptions) {
+        return null // We don't offer support for self-hosted instances
+    }
 
     return (
-        <Popup
-            overlay={
-                <>
-                    <a href={`https://posthog.com/slack${HELP_UTM_TAGS}`} rel="noopener" target="_blank">
-                        <LemonButton
-                            icon={<IconQuestionAnswer />}
-                            type="stealth"
-                            fullWidth
-                            onClick={() => {
-                                reportHelpButtonUsed(HelpType.Slack)
-                                hideHelp()
-                            }}
-                        >
-                            Message us on Slack
-                        </LemonButton>
-                    </a>
-                    <a href="https://github.com/PostHog/posthog/issues/new/choose" rel="noopener" target="_blank">
-                        <LemonButton
-                            icon={<IconGithub />}
-                            type="stealth"
-                            fullWidth
-                            onClick={() => {
-                                reportHelpButtonUsed(HelpType.GitHub)
-                                hideHelp()
-                            }}
-                        >
-                            Create an issue on GitHub
-                        </LemonButton>
-                    </a>
-                    <a href="mailto:hey@posthog.com" target="_blank">
-                        <LemonButton
-                            icon={<IconMail />}
-                            type="stealth"
-                            fullWidth
-                            onClick={() => {
-                                reportHelpButtonUsed(HelpType.Email)
-                                hideHelp()
-                            }}
-                        >
-                            Send us an email
-                        </LemonButton>
-                    </a>
-                    <a href={`https://posthog.com/docs${HELP_UTM_TAGS}`} rel="noopener" target="_blank">
-                        <LemonButton
-                            icon={<IconArticle />}
-                            type="stealth"
-                            fullWidth
-                            onClick={() => {
-                                reportHelpButtonUsed(HelpType.Docs)
-                                hideHelp()
-                            }}
-                        >
-                            Read the docs
-                        </LemonButton>
-                    </a>
-                </>
-            }
-            onClickOutside={hideHelp}
-            visible={isHelpVisible}
-            placement={placement}
-            actionable
-        >
-            <div
-                className={clsx('help-button', customComponent && 'custom-component', inline && 'inline')}
-                onClick={toggleHelp}
+        <>
+            <LemonMenu
+                items={[
+                    showSupportOptions && {
+                        items: [
+                            {
+                                label: 'Ask on the forum',
+                                icon: <IconQuestionAnswer />,
+                                onClick: () => {
+                                    reportHelpButtonUsed(HelpType.Slack)
+                                    hideHelp()
+                                },
+                                to: `https://posthog.com/questions${HELP_UTM_TAGS}`,
+                                targetBlank: true,
+                            },
+                            {
+                                label: 'Report a bug',
+                                icon: <IconBug />,
+                                onClick: () => {
+                                    reportHelpButtonUsed(HelpType.SupportForm)
+                                    openSupportForm({ kind: 'bug' })
+                                    hideHelp()
+                                },
+                            },
+                            {
+                                label: 'Give feedback',
+                                icon: <IconFeedback />,
+                                onClick: () => {
+                                    reportHelpButtonUsed(HelpType.SupportForm)
+                                    openSupportForm({ kind: 'feedback' })
+                                    hideHelp()
+                                },
+                            },
+                            {
+                                label: 'Get support',
+                                icon: <IconSupport />,
+                                onClick: () => {
+                                    reportHelpButtonUsed(HelpType.SupportForm)
+                                    openSupportForm({ kind: 'support' })
+                                    hideHelp()
+                                },
+                            },
+                        ],
+                    },
+                    !contactOnly && {
+                        items: [
+                            {
+                                label: 'Read the docs',
+                                icon: <IconDocument />,
+                                onClick: () => {
+                                    reportHelpButtonUsed(HelpType.Docs)
+                                    hideHelp()
+                                },
+                                to: `https://posthog.com/docs${HELP_UTM_TAGS}`,
+                                targetBlank: true,
+                            },
+                        ],
+                    },
+                ]}
+                onVisibilityChange={(visible) => !visible && hideHelp()}
+                visible={isHelpVisible}
+                placement={placement}
+                onClickOutside={hideHelp}
             >
-                {customComponent || (
-                    <>
-                        <IconHelpOutline />
-                        <IconArrowDropDown />
-                    </>
-                )}
-            </div>
-        </Popup>
+                <div className={clsx('help-button', inline && 'inline')} onClick={toggleHelp} data-attr="help-button">
+                    {customComponent || (
+                        <>
+                            <IconQuestion />
+                            <IconChevronDown />
+                        </>
+                    )}
+                </div>
+            </LemonMenu>
+        </>
     )
 }

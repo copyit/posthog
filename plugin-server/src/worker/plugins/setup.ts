@@ -1,129 +1,92 @@
-import { PluginAttachment } from '@posthog/plugin-scaffold'
+import { Gauge, Summary } from 'prom-client'
 
-import { Hub, Plugin, PluginConfig, PluginConfigId, PluginId, PluginTaskType, TeamId } from '../../types'
-import { getPluginAttachmentRows, getPluginConfigRows, getPluginRows } from '../../utils/db/sql'
+import { Hub, StatelessInstanceMap } from '../../types'
 import { status } from '../../utils/status'
-import { LazyPluginVM } from '../vm/lazy'
+import { constructPluginInstance } from '../vm/lazy'
 import { loadPlugin } from './loadPlugin'
+import { loadPluginsFromDB } from './loadPluginsFromDB'
+import { loadSchedule } from './loadSchedule'
 import { teardownPlugins } from './teardown'
 
-export async function setupPlugins(server: Hub): Promise<void> {
-    const { plugins, pluginConfigs, pluginConfigsPerTeam } = await loadPluginsFromDB(server)
+export const importUsedGauge = new Gauge({
+    name: 'plugin_import_used',
+    help: 'Imports used by plugins, broken down by import name and plugin_id',
+    labelNames: ['name', 'plugin_id'],
+})
+const setupPluginsMsSummary = new Summary({
+    name: 'setup_plugins_ms',
+    help: 'Time to setup plugins',
+    percentiles: [0.5, 0.9, 0.95, 0.99],
+})
+
+export async function setupPlugins(hub: Hub): Promise<void> {
+    const startTime = Date.now()
+    status.info('🔁', `Loading plugin configs...`)
+    const { plugins, pluginConfigs, pluginConfigsPerTeam } = await loadPluginsFromDB(hub)
     const pluginVMLoadPromises: Array<Promise<any>> = []
+    const statelessInstances = {} as StatelessInstanceMap
+
+    const timer = new Date()
+
     for (const [id, pluginConfig] of pluginConfigs) {
         const plugin = plugins.get(pluginConfig.plugin_id)
-        const prevConfig = server.pluginConfigs.get(id)
-        const prevPlugin = prevConfig ? server.plugins.get(pluginConfig.plugin_id) : null
+        const prevConfig = hub.pluginConfigs.get(id)
+        const prevPlugin = prevConfig ? hub.plugins.get(pluginConfig.plugin_id) : null
 
-        if (
-            prevConfig &&
-            pluginConfig.updated_at === prevConfig.updated_at &&
-            plugin?.updated_at == prevPlugin?.updated_at
-        ) {
-            pluginConfig.vm = prevConfig.vm
+        const pluginConfigChanged = !prevConfig || pluginConfig.updated_at !== prevConfig.updated_at
+        const pluginChanged = plugin?.updated_at !== prevPlugin?.updated_at
+
+        if (!pluginConfigChanged && !pluginChanged) {
+            pluginConfig.instance = prevConfig.instance
+        } else if (plugin?.is_stateless && statelessInstances[plugin.id]) {
+            pluginConfig.instance = statelessInstances[plugin.id]
         } else {
-            pluginConfig.vm = new LazyPluginVM()
-            pluginVMLoadPromises.push(loadPlugin(server, pluginConfig))
-
+            pluginConfig.instance = constructPluginInstance(hub, pluginConfig)
+            if (hub.PLUGIN_LOAD_SEQUENTIALLY) {
+                await loadPlugin(hub, pluginConfig)
+            } else {
+                pluginVMLoadPromises.push(loadPlugin(hub, pluginConfig))
+            }
             if (prevConfig) {
-                void teardownPlugins(server, prevConfig)
+                void teardownPlugins(hub, prevConfig)
+            }
+
+            if (plugin?.is_stateless) {
+                statelessInstances[plugin.id] = pluginConfig.instance
             }
         }
     }
 
     await Promise.all(pluginVMLoadPromises)
+    setupPluginsMsSummary.observe(new Date().getTime() - timer.getTime())
 
-    server.plugins = plugins
-    server.pluginConfigs = pluginConfigs
-    server.pluginConfigsPerTeam = pluginConfigsPerTeam
+    hub.plugins = plugins
+    hub.pluginConfigs = pluginConfigs
+    hub.pluginConfigsPerTeam = pluginConfigsPerTeam
 
-    for (const teamId of server.pluginConfigsPerTeam.keys()) {
-        server.pluginConfigsPerTeam.get(teamId)?.sort((a, b) => a.order - b.order)
-    }
-
-    void loadSchedule(server)
-}
-
-async function loadPluginsFromDB(
-    server: Hub
-): Promise<Pick<Hub, 'plugins' | 'pluginConfigs' | 'pluginConfigsPerTeam'>> {
-    const pluginRows = await getPluginRows(server)
-    const plugins = new Map<PluginId, Plugin>()
-
-    for (const row of pluginRows) {
-        plugins.set(row.id, row)
-    }
-
-    const pluginAttachmentRows = await getPluginAttachmentRows(server)
-    const attachmentsPerConfig = new Map<TeamId, Record<string, PluginAttachment>>()
-    for (const row of pluginAttachmentRows) {
-        let attachments = attachmentsPerConfig.get(row.plugin_config_id!)
-        if (!attachments) {
-            attachments = {}
-            attachmentsPerConfig.set(row.plugin_config_id!, attachments)
-        }
-        attachments[row.key] = {
-            content_type: row.content_type,
-            file_name: row.file_name,
-            contents: row.contents,
-        }
-    }
-
-    const pluginConfigRows = await getPluginConfigRows(server)
-
-    const pluginConfigs = new Map<PluginConfigId, PluginConfig>()
-    const pluginConfigsPerTeam = new Map<TeamId, PluginConfig[]>()
-
-    for (const row of pluginConfigRows) {
-        const plugin = plugins.get(row.plugin_id)
-        if (!plugin) {
-            continue
-        }
-        const pluginConfig: PluginConfig = {
-            ...row,
-            plugin: plugin,
-            attachments: attachmentsPerConfig.get(row.id) || {},
-            vm: null,
-        }
-        pluginConfigs.set(row.id, pluginConfig)
-
-        if (!row.team_id) {
-            console.error(`🔴 PluginConfig(id=${row.id}) without team_id!`)
-            continue
-        }
-
-        let teamConfigs = pluginConfigsPerTeam.get(row.team_id)
-        if (!teamConfigs) {
-            teamConfigs = []
-            pluginConfigsPerTeam.set(row.team_id, teamConfigs)
-        }
-        teamConfigs.push(pluginConfig)
-    }
-
-    return { plugins, pluginConfigs, pluginConfigsPerTeam }
-}
-
-export async function loadSchedule(server: Hub): Promise<void> {
-    server.pluginSchedule = null
-
-    // gather runEvery* tasks into a schedule
-    const pluginSchedule: Record<string, PluginConfigId[]> = { runEveryMinute: [], runEveryHour: [], runEveryDay: [] }
-
-    let count = 0
-
-    for (const [id, pluginConfig] of server.pluginConfigs) {
-        const tasks = (await pluginConfig.vm?.getTasks(PluginTaskType.Schedule)) ?? {}
-        for (const [taskName, task] of Object.entries(tasks)) {
-            if (task && taskName in pluginSchedule) {
-                pluginSchedule[taskName].push(id)
-                count++
+    importUsedGauge.reset()
+    const seenPlugins = new Set<number>()
+    for (const pluginConfig of pluginConfigs.values()) {
+        const usedImports = pluginConfig.instance?.usedImports
+        if (usedImports && !seenPlugins.has(pluginConfig.plugin_id)) {
+            seenPlugins.add(pluginConfig.plugin_id)
+            for (const importName of usedImports) {
+                importUsedGauge.set({ name: importName, plugin_id: pluginConfig.plugin_id }, 1)
             }
         }
     }
 
-    if (count > 0) {
-        status.info('🔌', `Loaded ${count} scheduled tasks`)
+    for (const teamId of hub.pluginConfigsPerTeam.keys()) {
+        hub.pluginConfigsPerTeam.get(teamId)?.sort((a, b) => a.order - b.order)
     }
 
-    server.pluginSchedule = pluginSchedule
+    // Only load the schedule in server that can process scheduled tasks, else the schedule won't be useful
+    if (hub.capabilities.pluginScheduledTasks) {
+        await loadSchedule(hub)
+    }
+
+    status.info(
+        '✅',
+        `Loaded ${pluginConfigs.size} configs for ${plugins.size} plugins, took ${Date.now() - startTime}ms`
+    )
 }

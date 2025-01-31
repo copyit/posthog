@@ -1,9 +1,8 @@
-import { createBuffer } from '@posthog/plugin-contrib'
 import { ConsoleExtension } from '@posthog/plugin-scaffold'
 
 import { Hub, PluginConfig, PluginLogEntrySource, PluginLogEntryType } from '../../../types'
 import { status } from '../../../utils/status'
-import { determineNodeEnv, NodeEnv, pluginDigest } from '../../../utils/utils'
+import { pluginDigest } from '../../../utils/utils'
 
 function consoleFormat(...args: unknown[]): string {
     return args
@@ -17,18 +16,20 @@ function consoleFormat(...args: unknown[]): string {
         .join(' ')
 }
 
-export function createConsole(server: Hub, pluginConfig: PluginConfig): ConsoleExtension {
+export function createConsole(hub: Hub, pluginConfig: PluginConfig): ConsoleExtension {
     async function consolePersist(type: PluginLogEntryType, ...args: unknown[]): Promise<void> {
-        if (determineNodeEnv() === NodeEnv.Development) {
-            status.info('👉', `${type} in ${pluginDigest(pluginConfig.plugin!, pluginConfig.team_id)}:`, ...args)
-        }
+        status.debug(
+            '👉',
+            `${type} in ${pluginDigest(pluginConfig.plugin || pluginConfig.plugin_id, pluginConfig.team_id)}:`,
+            ...args
+        )
 
-        await server.db.queuePluginLogEntry({
+        await hub.db.queuePluginLogEntry({
             pluginConfig,
             type,
             source: PluginLogEntrySource.Console,
             message: consoleFormat(...args),
-            instanceId: server.instanceId,
+            instanceId: hub.instanceId,
         })
     }
 

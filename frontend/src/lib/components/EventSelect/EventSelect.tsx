@@ -1,93 +1,77 @@
-import React from 'react'
-
-import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
 import { TaxonomicFilter } from 'lib/components/TaxonomicFilter/TaxonomicFilter'
-import { Tag } from 'antd'
-import { Popup } from 'lib/components/Popup/Popup'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { LemonSnack } from 'lib/lemon-ui/LemonSnack/LemonSnack'
+import { Popover } from 'lib/lemon-ui/Popover/Popover'
+import React, { useState } from 'react'
 
 interface EventSelectProps {
-    onChange: (names: string[]) => void
+    onItemChange?: (values: any[]) => void
+    onChange?: (names: string[]) => void
     selectedEvents: string[]
+    selectedItems?: any[]
     addElement: JSX.Element
+    filterGroupTypes?: TaxonomicFilterGroupType[]
 }
 
-export const EventSelect = ({ onChange, selectedEvents, addElement }: EventSelectProps): JSX.Element => {
-    const { open, toggle, hide } = usePopup()
+export const EventSelect = ({
+    onItemChange,
+    onChange,
+    selectedEvents,
+    selectedItems,
+    addElement,
+    filterGroupTypes,
+}: EventSelectProps): JSX.Element => {
+    const [open, setOpen] = useState<boolean>(false)
+    const eventSelectFilterGroupTypes = filterGroupTypes || [TaxonomicFilterGroupType.Events]
 
     const handleChange = (name: string): void => {
-        onChange(Array.from(new Set(selectedEvents.concat([name]))))
+        if (onChange) {
+            onChange(Array.from(new Set(selectedEvents.concat([name]))))
+        }
+    }
+
+    const handleItemChange = (item: any): void => {
+        if (selectedItems && onItemChange) {
+            onItemChange(Array.from(new Set(selectedItems?.concat([item]))))
+        }
     }
 
     const handleRemove = (name: string): void => {
-        onChange(selectedEvents.filter((p) => p !== name))
+        if (onChange) {
+            onChange(selectedEvents.filter((p) => p !== name))
+        }
+        if (onItemChange && selectedItems) {
+            onItemChange(selectedItems?.filter((p) => p.name !== name))
+        }
     }
 
-    // Add in the toggle popup logic for the passed in element
-    const addElementWithToggle = React.cloneElement(addElement, { onClick: toggle })
+    // Add in the toggle popover logic for the passed in element
+    const addElementWithToggle = React.cloneElement(addElement, { onClick: () => setOpen(!open) })
 
     return (
-        <div style={{ marginBottom: 16 }}>
+        <div className="flex items-center flex-wrap gap-2">
             {selectedEvents.map((name) => (
-                <PropertyTag handleRemove={handleRemove} name={name} key={name} />
+                <LemonSnack key={name} onClose={() => handleRemove(name)}>
+                    {name}
+                </LemonSnack>
             ))}
 
-            <Popup
+            <Popover
                 visible={open}
-                onClickOutside={() => hide()}
+                onClickOutside={() => setOpen(false)}
                 overlay={
                     <TaxonomicFilter
-                        onChange={(_, value) => {
+                        onChange={(_, value, item) => {
+                            handleItemChange(item)
                             handleChange(value as string)
-                            hide()
+                            setOpen(false)
                         }}
-                        taxonomicGroupTypes={[TaxonomicFilterGroupType.Events]}
+                        taxonomicGroupTypes={eventSelectFilterGroupTypes}
                     />
                 }
             >
                 {addElementWithToggle}
-            </Popup>
+            </Popover>
         </div>
     )
 }
-
-const popupLogic = {
-    // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-    toggle: (open: boolean) => !open,
-
-    // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-    hide: () => false,
-}
-
-// eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-const usePopup = () => {
-    const [open, setOpen] = React.useState<boolean>(false)
-
-    return {
-        open,
-        toggle: () => setOpen(popupLogic.toggle(open)),
-        hide: () => setOpen(popupLogic.hide()),
-    }
-}
-
-type PropertyTagProps = {
-    name: string
-    handleRemove: (name: string) => void
-}
-
-const PropertyTag = ({ name, handleRemove }: PropertyTagProps): JSX.Element => (
-    <Tag
-        key={name}
-        closable
-        onClose={(): void => handleRemove(name)}
-        style={{
-            margin: '0.25rem',
-            padding: '0.25rem 0.5em',
-            background: '#D9D9D9',
-            border: '1px solid #D9D9D9',
-            borderRadius: '40px',
-            fontSize: 'inherit',
-        }}
-    >
-        {name}
-    </Tag>
-)

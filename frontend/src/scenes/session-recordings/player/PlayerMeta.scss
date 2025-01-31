@@ -1,44 +1,88 @@
-@import '~/vars';
-
-.player-meta-container {
+.PlayerMeta {
+    position: relative;
     display: flex;
     flex-direction: column;
-    background-color: $bg_light;
-    border: 1px solid $border;
-    border-radius: $radius;
-    padding: $recording_spacing;
+    flex-shrink: 0;
+    overflow: hidden;
 
-    .player-meta-person {
-        margin-bottom: 0.5rem;
+    .PlayerMetaPersonProperties {
+        padding: 0.5rem;
+        overflow: auto;
+        background: var(--bg-3000);
+        border-bottom: 1px solid transparent;
+    }
 
-        .player-meta-person-title {
-            flex: 1;
+    &:not(.PlayerMeta--fullscreen) {
+        .PlayerMetaPersonProperties {
+            transition: 200ms height ease-out, 200ms border-bottom-color ease-out;
 
-            .email {
-                font-weight: 600;
-                width: 100%;
+            &--enter {
+                height: 0;
             }
 
-            .time {
-                font-weight: 600;
+            &--enter-active,
+            &--enter-done {
+                height: 14rem;
+                border-bottom-color: var(--border);
+            }
+
+            &--exit {
+                height: 14rem;
+                border-bottom-color: var(--border);
+            }
+
+            &--exit-active {
+                height: 0;
+            }
+        }
+
+        .LemonModal & {
+            .PlayerMeta__top {
+                padding-right: 3.5rem !important;
             }
         }
     }
-    .player-meta-other {
-        flex-direction: column;
 
-        .player-meta-other-description,
-        .player-meta-other-resolution {
+    &--fullscreen {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+
+        .PlayerMetaPersonProperties {
+            position: fixed;
+            top: 48px;
+            bottom: 97px; // NOTE: This isn't perfect but for now hardcoded to match the bottom area size.
+            left: 0;
+            z-index: 1;
             width: 100%;
-            height: 20px;
+            max-width: 40rem;
+            border-right: 1px solid var(--border);
+            transition: 200ms transform ease-out;
+
+            &--enter {
+                transform: translateX(-100%);
+            }
+
+            &--enter-active,
+            &--enter-done {
+                transform: translateX(0);
+            }
+
+            &--exit {
+                transform: translateX(0);
+            }
+
+            &--exit-active {
+                transform: translateX(-100%);
+            }
         }
     }
 
-    .ant-skeleton-paragraph {
-        margin: 0;
+    .Link {
+        color: var(--text-3000);
 
-        li {
-            height: 12px;
+        &:hover {
+            color: var(--accent-primary);
         }
     }
 }

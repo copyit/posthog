@@ -4,11 +4,12 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("posthog", "0183_groups_pg"),
     ]
 
     operations = [
-        migrations.DeleteModel(name="SessionsFilter",),
+        migrations.DeleteModel(
+            name="SessionsFilter",
+        ),
     ]

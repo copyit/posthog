@@ -1,23 +1,20 @@
-import React, { useEffect } from 'react'
 import { useActions, useValues } from 'kea'
-import { personsLogic } from './personsLogic'
-import Skeleton from 'antd/lib/skeleton'
+import { LemonTable, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { Link } from 'lib/lemon-ui/Link'
+import { useEffect } from 'react'
+import { urls } from 'scenes/urls'
+
 import { CohortType } from '~/types'
-import { LemonTable, LemonTableColumns } from 'lib/components/LemonTable/LemonTable'
+
+import { personsLogic } from './personsLogic'
 
 export function PersonCohorts(): JSX.Element {
-    const { cohorts, cohortsLoading } = useValues(personsLogic)
-    const { loadCohorts, navigateToCohort } = useActions(personsLogic)
+    const { cohorts, cohortsLoading, person } = useValues(personsLogic)
+    const { loadCohorts } = useActions(personsLogic)
 
     useEffect(() => {
-        if (cohorts === null && !cohortsLoading) {
-            loadCohorts()
-        }
-    }, [cohorts, cohortsLoading])
-
-    if (cohortsLoading) {
-        return <Skeleton paragraph={{ rows: 2 }} active />
-    }
+        loadCohorts()
+    }, [person])
 
     const columns: LemonTableColumns<CohortType> = [
         {
@@ -25,32 +22,33 @@ export function PersonCohorts(): JSX.Element {
             dataIndex: 'name',
             key: 'name',
             className: 'ph-no-capture',
+            render: function RenderName(_, cohort) {
+                return (
+                    <Link to={urls.cohort(cohort.id)}>
+                        <strong>{cohort.name}</strong>
+                    </Link>
+                )
+            },
             sorter: (a, b) => (a.name || '').localeCompare(b.name || ''),
         },
         {
             title: 'Users in cohort',
             render: function RenderCount(count) {
-                return (count as number).toLocaleString()
+                return (count as number)?.toLocaleString()
             },
             dataIndex: 'count',
             sorter: (a, b) => (a.count || 0) - (b.count || 0),
         },
     ]
 
-    return cohorts?.length ? (
+    return (
         <LemonTable
-            dataSource={cohorts}
+            dataSource={cohorts || []}
             loading={cohortsLoading}
             columns={columns}
-            rowClassName="cursor-pointer"
             rowKey="id"
             pagination={{ pageSize: 30, hideOnSinglePage: true }}
-            embedded
-            onRow={(cohort) => ({
-                onClick: () => navigateToCohort(cohort),
-            })}
+            emptyState="This person doesn't belong to any cohort"
         />
-    ) : (
-        <i>This person doesn't belong to any cohort</i>
     )
 }
